@@ -4,6 +4,7 @@
 
 <p align="center">
   <a href="https://www.npmjs.com/package/figma-canvas-mcp"><img src="https://img.shields.io/npm/v/figma-canvas-mcp.svg?style=flat-square&color=white" alt="npm version"></a>
+  <a href="https://github.com/nicktofal/figma-canvas-mcp"><img src="https://img.shields.io/github/stars/nicktofal/figma-canvas-mcp?style=flat-square&color=white" alt="github stars"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-white.svg?style=flat-square" alt="license"></a>
   <a href="https://modelcontextprotocol.io"><img src="https://img.shields.io/badge/MCP-Compatible-white.svg?style=flat-square" alt="Model Context Protocol"></a>
   <a href="https://nodejs.org"><img src="https://img.shields.io/badge/node-%3E%3D18-white.svg?style=flat-square" alt="node version"></a>
@@ -135,7 +136,7 @@ claude mcp add figma-canvas-mcp -- npx -y figma-canvas-mcp
 
 ### Step 2: Load the Companion Plugin (Once)
 
-1. Clone or download this repository.
+1. Clone this repository: `git clone https://github.com/nicktofal/figma-canvas-mcp.git`
 2. In Figma Desktop: *Plugins → Development → Import plugin from manifest…*
 3. Select `plugin/manifest.json`.
 

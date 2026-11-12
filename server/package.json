@@ -4,6 +4,15 @@
   "description": "Figma Canvas MCP: the open, full-access Canvas engine for AI agents in Figma (Auto Layout, CSS Grid, Motion timeline, and atomic JS REPL).",
   "type": "module",
   "license": "MIT",
+  "author": "Aziz Yuldashev <nicktofal@gmail.com>",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/nicktofal/figma-canvas-mcp.git"
+  },
+  "bugs": {
+    "url": "https://github.com/nicktofal/figma-canvas-mcp/issues"
+  },
+  "homepage": "https://github.com/nicktofal/figma-canvas-mcp#readme",
   "bin": {
     "figma-canvas-mcp": "dist/index.js"
   },
