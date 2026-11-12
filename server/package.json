@@ -1,0 +1,50 @@
+{
+  "name": "figma-canvas-mcp",
+  "version": "0.2.0",
+  "description": "Figma Canvas MCP: the open, full-access Canvas engine for AI agents in Figma (Auto Layout, CSS Grid, Motion timeline, and atomic JS REPL).",
+  "type": "module",
+  "license": "MIT",
+  "bin": {
+    "figma-canvas-mcp": "dist/index.js"
+  },
+  "files": [
+    "dist",
+    "skills",
+    "plugin"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "prepack": "node -e \"const fs=require('fs'); if(fs.existsSync('../plugin')) fs.cpSync('../plugin', './plugin', {recursive:true});\"",
+    "postpack": "node -e \"const fs=require('fs'); if(fs.existsSync('./plugin')) fs.rmSync('./plugin', {recursive:true, force:true});\"",
+    "start": "node dist/index.js",
+    "dev": "tsc -w"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "keywords": [
+    "figma",
+    "mcp",
+    "model-context-protocol",
+    "figma-canvas",
+    "canvas-engine",
+    "auto-layout",
+    "css-grid",
+    "cursor",
+    "claude-code",
+    "ai-agent"
+  ],
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.32.2",
+    "ws": "^8.22.2",
+    "zod": "^4.6.7"
+  },
+  "devDependencies": {
+    "@types/node": "^26.6.6",
+    "@types/ws": "^8.18.2",
+    "typescript": "^7.0.2"
+  },
+  "optionalDependencies": {
+    "ffmpeg-static": "^5.3.0"
+  }
+}
