@@ -915,6 +915,90 @@ async function doRead(p) {
 
 // ───────────────────────── execute ─────────────────────────
 
+
+// ───────────────────────── effects: transform, isometric, glow ─────────────────────────
+
+/** Compose two 2×3 affine matrices: apply B first, then A. */
+function mulAffine(A, B) {
+  return [
+    [A[0][0] * B[0][0] + A[0][1] * B[1][0], A[0][0] * B[0][1] + A[0][1] * B[1][1], A[0][0] * B[0][2] + A[0][1] * B[1][2] + A[0][2]],
+    [A[1][0] * B[0][0] + A[1][1] * B[1][0], A[1][0] * B[0][1] + A[1][1] * B[1][1], A[1][0] * B[0][2] + A[1][1] * B[1][2] + A[1][2]],
+  ];
+}
+
+/**
+ * Apply a linear map m = [a, b, c, d] (x' = a·x + c·y, y' = b·x + d·y) to a node around its centre.
+ * Figma keeps skew in relativeTransform, so this stays a live, editable layer.
+ */
+function transformAround(node, m) {
+  var T0 = node.relativeTransform, w = node.width, h = node.height;
+  var cx = T0[0][0] * w / 2 + T0[0][1] * h / 2 + T0[0][2], cy = T0[1][0] * w / 2 + T0[1][1] * h / 2 + T0[1][2];
+  var M = [[m[0], m[2], 0], [m[1], m[3], 0]];
+  var toC = [[1, 0, cx], [0, 1, cy]], fromC = [[1, 0, -cx], [0, 1, -cy]];
+  node.relativeTransform = mulAffine(toC, mulAffine(M, mulAffine(fromC, T0)));
+  return node;
+}
+
+// Isometric projection of a flat layer onto a face of a cube (axes at ±30°, lengths preserved).
+var ISO_FACES = {
+  top: [0.8660254, 0.5, -0.8660254, 0.5],
+  left: [0.8660254, 0.5, 0, 1],
+  right: [0.8660254, -0.5, 0, 1],
+};
+
+function isoTransform(node, face, o) {
+  o = o || {};
+  var m = ISO_FACES[face];
+  if (!m) throw new Error("h.iso face must be top | left | right, got '" + face + "'");
+  var s = o.scale === undefined ? 1 : o.scale;
+  return transformAround(node, [m[0] * s, m[1] * s, m[2] * s, m[3] * s]);
+}
+
+function recolorTree(n, color) {
+  var paint = H.solid(color);
+  if ("fills" in n && n.fills !== figma.mixed && n.fills.length) n.fills = n.fills.map(function (f) { return f.type === "IMAGE" ? f : paint; });
+  if ("strokes" in n && n.strokes.length) n.strokes = n.strokes.map(function () { return paint; });
+  if ("children" in n) n.children.forEach(function (c) { recolorTree(c, color); });
+}
+
+/**
+ * Deep-Glow-style bloom: a stack of blurred copies whose radii double from a tight core to `radius`,
+ * blended additively (LINEAR_DODGE) above the source. Returns the group holding the glow layers.
+ * o: radius (px, widest blur, default 48) · intensity (strength, default 1) · spread 0..1 (0 = tight core, 1 = wide haze, default 0.5)
+ *    steps (octaves, 3–8, default 5) · color (override tint, hex) · blend (LINEAR_DODGE | SCREEN, default LINEAR_DODGE) · name
+ */
+function makeGlow(node, o) {
+  o = o || {};
+  var radius = o.radius === undefined ? 48 : o.radius, intensity = o.intensity === undefined ? 1 : o.intensity;
+  var spread = Math.max(0, Math.min(1, o.spread === undefined ? 0.5 : o.spread));
+  var steps = Math.max(3, Math.min(8, Math.round(o.steps === undefined ? 5 : o.steps)));
+  var blend = o.blend || "LINEAR_DODGE", e = (spread - 0.5) * 2;
+  var parent = node.parent, index = parent.children.indexOf(node);
+  var layers = [], weights = [], radii = [];
+  for (var k = 0; k < steps; k++) {
+    var r = radius / Math.pow(2, steps - 1 - k);
+    radii.push(r);
+    weights.push(Math.pow(r / radius, e));
+  }
+  var wmax = Math.max.apply(null, weights);
+  for (var i = 0; i < steps; i++) {
+    var total = intensity * (weights[i] / wmax) * 0.55, copies = Math.max(1, Math.min(4, Math.ceil(total)));
+    for (var c = 0; c < copies; c++) {
+      var cl = node.clone();
+      cl.name = "glow " + Math.round(radii[i]) + "px";
+      if (o.color) recolorTree(cl, o.color);
+      cl.effects = [{ type: "LAYER_BLUR", radius: Math.max(0.5, radii[i]), visible: true }];
+      cl.blendMode = blend;
+      cl.opacity = Math.min(1, total / copies);
+      layers.push(cl);
+    }
+  }
+  var g = figma.group(layers, parent, index + 1);
+  g.name = o.name || "Glow";
+  if (parent.layoutMode && parent.layoutMode !== "NONE") { try { g.layoutPositioning = "ABSOLUTE"; } catch (err) { /* older files */ } }
+  return g;
+}
+
 /** Small helper library exposed to `execute` code as `h`. */
 var H = {
   rgb: function (h) { var c = hexToRgba(h); return { r: c.r, g: c.g, b: c.b }; },
@@ -1004,6 +1088,12 @@ var H = {
     } else node.setBoundVariable(field, v);
     return node;
   },
+  /** Apply a linear map [a,b,c,d] (x'=a·x+c·y, y'=b·x+d·y) around the node centre: skew, shear, flip, any affine warp. */
+  transform: transformAround,
+  /** Isometric projection onto a cube face: h.iso(node, 'top' | 'left' | 'right', {scale}). Apply once per node. */
+  iso: isoTransform,
+  /** Additive multi-radius bloom above the node (see makeGlow options). Returns the glow group. */
+  glow: makeGlow,
   progress: function (done, total, note) { progress(done, total, note); },
   /** Call another bridge command from code, e.g. h.run('motion', {op:'animate', …}) — batches several commands into one undo step. */
   run: function (method, params) {

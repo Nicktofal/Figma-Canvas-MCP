@@ -63,7 +63,7 @@ OpenCode uses its own format:
 | `history` | Undo by steps, with a guard so the agent does not undo your own edits. Can also save a named version. |
 | `read` | Compact JSON view of the selection, a node, a page or the whole file. |
 | `screenshot` | PNG of a node or the selection. |
-| `compare` | Pixel diff of a node against another node, a PNG file or a URL. Returns the mismatch ratio and a diff image. |
+| `compare` | Perceptual diff of a node against another node, a PNG file or a URL: CIEDE2000 and SSIM with a PASS/FAIL verdict against explicit tolerances, a ΔE heat-map, worst regions with colour hints, and a diff image. |
 | `to_code` | Exports nodes as HTML/CSS or React JSX. |
 | `export` | Exports nodes to disk as PNG, SVG, PDF, JSON, or video. |
 | `motion` | Works with Figma's native motion timeline: keyframes, durations, presets. |
@@ -81,7 +81,7 @@ OpenCode uses its own format:
 
 | Variable | Default | Purpose |
 | :--- | :--- | :--- |
-| `FIGMA_MCP_PORT` | `3055` | Port of the local WebSocket relay. |
+| `FIGMA_MCP_PORT` | `3055` | Port of the local WebSocket relay. Several agent sessions share it: the first becomes the hub, the others attach to it. |
 | `FIGMA_MCP_IMAGES` | on | Set to `0` to stop returning images (for clients without image input). |
 | `FIGMA_TOKEN` | unset | Personal access token, needed only for `figma_rest`. |
 | `FFMPEG_PATH` | bundled | Use your own ffmpeg instead of `ffmpeg-static`. |

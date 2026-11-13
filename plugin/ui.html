@@ -152,7 +152,7 @@ function noteFor(method, params, result, err) {
   if (method === "insert_asset") return params.kind || "";
   if (method === "export") return (params.format || "PNG") + (result && result.files ? " · " + result.files.length + " file(s)" : "");
   if (method === "motion" || method === "history" || method === "library" || method === "page") return params.op || "";
-  if (method === "compare" && result) return Math.round(result.mismatch * 1000) / 10 + "% diff";
+  if (method === "compare" && result) return result.verdict + " · SSIM " + result.metrics.ssim + " · ΔE " + result.metrics.meanDeltaE;
   if (method === "execute") return String(params.code || "").replace(/\s+/g, " ").slice(0, 40);
   return "";
 }
@@ -347,52 +347,211 @@ async function loadSide(s) {
   return createImageBitmap(new Blob([bytes]));
 }
 
-/** Pixel diff of two images (Figma nodes or PNG/JPG data). B is resized to A. */
+// Tolerance presets: tolerance = per-pixel ΔE2000 above which a pixel counts as different,
+// maxMismatch = allowed share of such pixels, maxMeanDeltaE = allowed mean ΔE, minSsim = required structural similarity.
+var CMP_PRESETS = {
+  strict: { tolerance: 2.3, maxMismatch: 0.005, maxMeanDeltaE: 1, minSsim: 0.98 },
+  normal: { tolerance: 5, maxMismatch: 0.02, maxMeanDeltaE: 2.5, minSsim: 0.95 },
+  loose: { tolerance: 10, maxMismatch: 0.08, maxMeanDeltaE: 6, minSsim: 0.85 },
+};
+var CMP_MAX_SIDE = 1600; // analysis resolution cap (keeps big frames fast)
+var SRGB_LIN = (function () {
+  var t = new Float32Array(256);
+  for (var i = 0; i < 256; i++) { var c = i / 255; t[i] = c <= 0.04045 ? c / 12.92 : Math.pow((c + 0.055) / 1.055, 2.4); }
+  return t;
+})();
+function labF(t) { return t > 0.008856 ? Math.cbrt(t) : 7.787 * t + 16 / 116; }
+function labOf(r, g, b, out) {
+  var R = SRGB_LIN[r], G = SRGB_LIN[g], B = SRGB_LIN[b];
+  var fx = labF((0.4124564 * R + 0.3575761 * G + 0.1804375 * B) / 0.95047);
+  var fy = labF(0.2126729 * R + 0.7151522 * G + 0.072175 * B);
+  var fz = labF((0.0193339 * R + 0.119192 * G + 0.9503041 * B) / 1.08883);
+  out[0] = 116 * fy - 16; out[1] = 500 * (fx - fy); out[2] = 200 * (fy - fz);
+}
+/** CIEDE2000 colour difference (Sharma et al. reference formulation). */
+function deltaE2000(L1, a1, b1, L2, a2, b2) {
+  var PI = Math.PI;
+  var C1 = Math.sqrt(a1 * a1 + b1 * b1), C2 = Math.sqrt(a2 * a2 + b2 * b2), Cb = (C1 + C2) / 2;
+  var Cb7 = Math.pow(Cb, 7), G = 0.5 * (1 - Math.sqrt(Cb7 / (Cb7 + 6103515625)));
+  var ap1 = (1 + G) * a1, ap2 = (1 + G) * a2;
+  var Cp1 = Math.sqrt(ap1 * ap1 + b1 * b1), Cp2 = Math.sqrt(ap2 * ap2 + b2 * b2);
+  var hp1 = Math.atan2(b1, ap1); if (hp1 < 0) hp1 += 2 * PI;
+  var hp2 = Math.atan2(b2, ap2); if (hp2 < 0) hp2 += 2 * PI;
+  var dL = L2 - L1, dC = Cp2 - Cp1, dh = 0, zero = Cp1 * Cp2 === 0;
+  if (!zero) { dh = hp2 - hp1; if (dh > PI) dh -= 2 * PI; else if (dh < -PI) dh += 2 * PI; }
+  var dH = 2 * Math.sqrt(Cp1 * Cp2) * Math.sin(dh / 2);
+  var Lb = (L1 + L2) / 2, Cpb = (Cp1 + Cp2) / 2, hb;
+  if (zero) hb = hp1 + hp2;
+  else { hb = (hp1 + hp2) / 2; if (Math.abs(hp1 - hp2) > PI) hb += hp1 + hp2 < 2 * PI ? PI : -PI; }
+  var T = 1 - 0.17 * Math.cos(hb - PI / 6) + 0.24 * Math.cos(2 * hb) + 0.32 * Math.cos(3 * hb + PI / 30) - 0.2 * Math.cos(4 * hb - 63 * PI / 180);
+  var dTheta = 30 * PI / 180 * Math.exp(-Math.pow((hb * 180 / PI - 275) / 25, 2));
+  var Cpb7 = Math.pow(Cpb, 7), Rc = 2 * Math.sqrt(Cpb7 / (Cpb7 + 6103515625));
+  var Sl = 1 + 0.015 * Math.pow(Lb - 50, 2) / Math.sqrt(20 + Math.pow(Lb - 50, 2));
+  var Sc = 1 + 0.045 * Cpb, Sh = 1 + 0.015 * Cpb * T, Rt = -Math.sin(2 * dTheta) * Rc;
+  var x = dL / Sl, y = dC / Sc, z = dH / Sh;
+  return Math.sqrt(Math.max(0, x * x + y * y + z * z + Rt * y * z));
+}
+function hex2(r, g, b) { return "#" + [r, g, b].map(function (v) { return (v < 16 ? "0" : "") + v.toString(16); }).join(""); }
+/** Plain-language description of how colour a differs from reference b. */
+function colorHint(ca, cb) {
+  var la = [0, 0, 0], lb = [0, 0, 0];
+  labOf(ca[0], ca[1], ca[2], la); labOf(cb[0], cb[1], cb[2], lb);
+  var parts = [], dL = la[0] - lb[0];
+  if (Math.abs(dL) > 3) parts.push(dL > 0 ? "lighter" : "darker");
+  var Ca = Math.hypot(la[1], la[2]), Cb = Math.hypot(lb[1], lb[2]);
+  if (Math.abs(Ca - Cb) > 5) parts.push(Ca > Cb ? "more saturated" : "less saturated");
+  if (Ca > 15 && Cb > 15) {
+    var dh = (Math.atan2(la[2], la[1]) - Math.atan2(lb[2], lb[1])) * 180 / Math.PI;
+    if (dh > 180) dh -= 360; else if (dh < -180) dh += 360;
+    if (Math.abs(dh) > 12) parts.push("hue shifted " + (dh > 0 ? "+" : "") + Math.round(dh) + "°");
+  }
+  return parts.length ? "a is " + parts.join(", ") + " than b" : "average colours match; the difference is in structure or detail";
+}
+
+/**
+ * Perceptual comparison of a (candidate) with b (reference): CIEDE2000 pixel difference, SSIM, per-cell
+ * breakdown with colour hints, and a pass/fail verdict against explicit tolerances.
+ * B is fitted into A's frame (stretch | contain | cover).
+ */
 async function compareImages(p) {
+  function opt(v, d) { return v === undefined || v === null ? d : v; }
+  var pre = CMP_PRESETS[p.preset || "normal"] || CMP_PRESETS.normal;
+  var tol = opt(p.tolerance, pre.tolerance), maxMismatch = opt(p.maxMismatch, pre.maxMismatch);
+  var maxMeanDE = opt(p.maxMeanDeltaE, pre.maxMeanDeltaE), minSsim = opt(p.minSsim, pre.minSsim);
+  var fit = p.fit || "stretch", G = Math.max(2, Math.min(24, Math.round(opt(p.grid, 8))));
   var A = await loadSide(p.a), B = await loadSide(p.b);
-  var W = A.width, H = A.height;
-  function pixels(bm) {
+  var unit = p.a.nodeId ? (p.a.scale || 1) : 1;
+
+  // region of interest, in A's pixel space
+  var rg = { x: 0, y: 0, w: A.width, h: A.height };
+  if (p.region) {
+    var rx = Math.max(0, Math.round(p.region.x * unit)), ry = Math.max(0, Math.round(p.region.y * unit));
+    rg = { x: rx, y: ry, w: Math.max(1, Math.min(A.width - rx, Math.round(p.region.w * unit))), h: Math.max(1, Math.min(A.height - ry, Math.round(p.region.h * unit))) };
+  }
+  var k = Math.min(1, CMP_MAX_SIDE / Math.max(rg.w, rg.h));
+  var W = Math.max(1, Math.round(rg.w * k)), H = Math.max(1, Math.round(rg.h * k));
+  var bg = p.background || "#ffffff";
+
+  function place(bm, isB) {
+    var dx = 0, dy = 0, dw = A.width, dh = A.height;
+    if (isB && fit !== "stretch") {
+      var s = fit === "cover" ? Math.max(A.width / B.width, A.height / B.height) : Math.min(A.width / B.width, A.height / B.height);
+      dw = B.width * s; dh = B.height * s; dx = (A.width - dw) / 2; dy = (A.height - dh) / 2;
+    }
     var c = document.createElement("canvas"); c.width = W; c.height = H;
     var g = c.getContext("2d", { willReadFrequently: true });
-    g.fillStyle = "#fff"; g.fillRect(0, 0, W, H);
-    g.drawImage(bm, 0, 0, W, H);
-    return g.getImageData(0, 0, W, H);
+    g.imageSmoothingQuality = "high";
+    g.fillStyle = bg; g.fillRect(0, 0, W, H);
+    g.drawImage(bm, (dx - rg.x) * k, (dy - rg.y) * k, dw * k, dh * k);
+    return { canvas: c, data: g.getImageData(0, 0, W, H) };
   }
-  var a = pixels(A), b = pixels(B);
-  var thr = (p.threshold === undefined ? 0.1 : p.threshold) * 255;
-  var out = new ImageData(W, H), bad = 0, sum = 0;
-  var G = 8, cells = new Array(G * G).fill(0);
-  var minX = W, minY = H, maxX = -1, maxY = -1;
+  var pa = place(A, false), pb = place(B, true), a = pa.data.data, b = pb.data.data;
+
+  var N = W * H, LA = new Float32Array(N), LB = new Float32Array(N), dE = new Float32Array(N);
+  var cells = [];
+  for (var ci = 0; ci < G * G; ci++) cells.push({ n: 0, bad: 0, de: 0, ra: 0, ga: 0, ba: 0, rb: 0, gb: 0, bb: 0, ss: 0, sn: 0 });
+  var hist = new Uint32Array(1001), bad = 0, sumDE = 0, maxDE = 0, sumDL = 0;
+  var la = [0, 0, 0], lb = [0, 0, 0];
   for (var y = 0; y < H; y++) {
+    var cy = Math.min(G - 1, Math.floor(y * G / H)) * G;
     for (var x = 0; x < W; x++) {
-      var i = (y * W + x) * 4;
-      var d = Math.max(Math.abs(a.data[i] - b.data[i]), Math.abs(a.data[i + 1] - b.data[i + 1]), Math.abs(a.data[i + 2] - b.data[i + 2]));
-      sum += d;
-      var gray = (a.data[i] * 0.3 + a.data[i + 1] * 0.59 + a.data[i + 2] * 0.11) * 0.35 + 165;
-      if (d > thr) {
-        bad++;
-        cells[Math.min(G - 1, Math.floor(y / H * G)) * G + Math.min(G - 1, Math.floor(x / W * G))]++;
-        if (x < minX) minX = x; if (y < minY) minY = y; if (x > maxX) maxX = x; if (y > maxY) maxY = y;
-        out.data[i] = 255; out.data[i + 1] = 40; out.data[i + 2] = 60;
-      } else { out.data[i] = out.data[i + 1] = out.data[i + 2] = gray; }
-      out.data[i + 3] = 255;
+      var i = y * W + x, j = i * 4;
+      labOf(a[j], a[j + 1], a[j + 2], la); labOf(b[j], b[j + 1], b[j + 2], lb);
+      LA[i] = la[0]; LB[i] = lb[0]; sumDL += la[0] - lb[0];
+      var d = (a[j] === b[j] && a[j + 1] === b[j + 1] && a[j + 2] === b[j + 2]) ? 0 : deltaE2000(la[0], la[1], la[2], lb[0], lb[1], lb[2]);
+      dE[i] = d; sumDE += d; if (d > maxDE) maxDE = d;
+      hist[Math.min(1000, Math.round(d * 10))]++;
+      var c = cells[cy + Math.min(G - 1, Math.floor(x * G / W))];
+      c.n++; c.de += d; c.ra += a[j]; c.ga += a[j + 1]; c.ba += a[j + 2]; c.rb += b[j]; c.gb += b[j + 1]; c.bb += b[j + 2];
+      if (d > tol) { bad++; c.bad++; }
     }
   }
-  var cellArea = (W / G) * (H / G);
-  var hot = cells.map(function (n, idx) { return { row: Math.floor(idx / G), col: idx % G, mismatch: n / cellArea }; })
-    .filter(function (c) { return c.mismatch > 0.01; }).sort(function (u, v) { return v.mismatch - u.mismatch; }).slice(0, 6)
-    .map(function (c) { return { x: Math.round(c.col * W / G), y: Math.round(c.row * H / G), w: Math.round(W / G), h: Math.round(H / G), mismatch: Math.round(c.mismatch * 1000) / 1000 }; });
+  var acc = 0, p95 = 0, target = N * 0.95;
+  for (var hI = 0; hI < hist.length; hI++) { acc += hist[hI]; if (acc >= target) { p95 = hI / 10; break; } }
+
+  // SSIM on the L* channel, 8×8 windows, stride 4
+  var win = Math.min(8, W, H), st = Math.max(1, Math.floor(win / 2)), C1 = 1, C2 = 9, ssSum = 0, ssN = 0;
+  for (var by = 0; by + win <= H; by += st) {
+    for (var bx = 0; bx + win <= W; bx += st) {
+      var sa = 0, sb = 0, saa = 0, sbb = 0, sab = 0;
+      for (var yy = by; yy < by + win; yy++) {
+        for (var xx = bx; xx < bx + win; xx++) { var u = LA[yy * W + xx], v = LB[yy * W + xx]; sa += u; sb += v; saa += u * u; sbb += v * v; sab += u * v; }
+      }
+      var nn = win * win, ma = sa / nn, mb = sb / nn, va = saa / nn - ma * ma, vb = sbb / nn - mb * mb, cv = sab / nn - ma * mb;
+      var ssim = ((2 * ma * mb + C1) * (2 * cv + C2)) / ((ma * ma + mb * mb + C1) * (va + vb + C2));
+      ssSum += ssim; ssN++;
+      var cc = cells[Math.min(G - 1, Math.floor((by + win / 2) * G / H)) * G + Math.min(G - 1, Math.floor((bx + win / 2) * G / W))];
+      cc.ss += ssim; cc.sn++;
+    }
+  }
+  var SSIM = ssN ? ssSum / ssN : 1;
+
+  function r(v, n) { var m = Math.pow(10, n); return Math.round(v * m) / m; }
+  var mismatch = bad / N, meanDE = sumDE / N;
+  var cw = rg.w / G, ch = rg.h / G;
+  var ranked = cells.map(function (c, idx) {
+    var m = c.n || 1;
+    var ca = [Math.round(c.ra / m), Math.round(c.ga / m), Math.round(c.ba / m)], cb = [Math.round(c.rb / m), Math.round(c.gb / m), Math.round(c.bb / m)];
+    return {
+      row: Math.floor(idx / G), col: idx % G, meanDE: c.de / m, mismatch: c.bad / m, ssim: c.sn ? c.ss / c.sn : 1, ca: ca, cb: cb,
+    };
+  });
+  var heatmap = [];
+  for (var row = 0; row < G; row++) heatmap.push(ranked.slice(row * G, row * G + G).map(function (c) { return Math.min(9, Math.round(c.meanDE)); }).join(""));
+  var hotspots = ranked.filter(function (c) { return c.mismatch > maxMismatch || c.meanDE > maxMeanDE || c.ssim < minSsim; })
+    .sort(function (u, v) { return v.meanDE - u.meanDE; }).slice(0, 8)
+    .map(function (c) {
+      return {
+        x: r((rg.x + c.col * cw) / unit, 1), y: r((rg.y + c.row * ch) / unit, 1), w: r(cw / unit, 1), h: r(ch / unit, 1),
+        mismatch: r(c.mismatch, 3), meanDeltaE: r(c.meanDE, 2), ssim: r(c.ssim, 3),
+        colorA: hex2(c.ca[0], c.ca[1], c.ca[2]), colorB: hex2(c.cb[0], c.cb[1], c.cb[2]), hint: colorHint(c.ca, c.cb),
+      };
+    });
+
+  var failed = [];
+  if (mismatch > maxMismatch) failed.push("mismatch " + r(mismatch * 100, 2) + "% > " + r(maxMismatch * 100, 2) + "%");
+  if (meanDE > maxMeanDE) failed.push("meanDeltaE " + r(meanDE, 2) + " > " + maxMeanDE);
+  if (SSIM < minSsim) failed.push("ssim " + r(SSIM, 3) + " < " + minSsim);
+  var aspectMismatch = Math.abs(A.width / A.height - B.width / B.height) > 0.02;
+  var score = Math.round(100 * (0.5 * Math.max(0, SSIM) + 0.3 * (1 - Math.min(1, meanDE / 10)) + 0.2 * (1 - Math.min(1, mismatch * 5))));
+
+  // diff heat-map: dimmed A, differences tinted red by how far above the tolerance they are
+  var out = new ImageData(W, H);
+  for (var q = 0; q < N; q++) {
+    var o = q * 4, gray = (a[o] * 0.3 + a[o + 1] * 0.59 + a[o + 2] * 0.11) * 0.35 + 165, dd = dE[q];
+    if (dd > tol) {
+      var t = 0.45 + 0.55 * Math.min(1, (dd - tol) / (tol * 4));
+      out.data[o] = gray * (1 - t) + 255 * t; out.data[o + 1] = gray * (1 - t) + 40 * t; out.data[o + 2] = gray * (1 - t) + 60 * t;
+    } else out.data[o] = out.data[o + 1] = out.data[o + 2] = gray;
+    out.data[o + 3] = 255;
+  }
   var dc = document.createElement("canvas"); dc.width = W; dc.height = H;
   dc.getContext("2d").putImageData(out, 0, 0);
-  var blob = await new Promise(function (r) { dc.toBlob(r, "image/png"); });
+  var images = [];
+  var mode = p.images || "diff";
+  if (mode !== "none") {
+    var sheet = dc, name = "diff (red = ΔE above " + tol + ")";
+    if (mode === "all") {
+      var sc = Math.min(1, 700 / W), tw = Math.round(W * sc), th = Math.round(H * sc);
+      sheet = document.createElement("canvas"); sheet.width = tw * 3 + 8; sheet.height = th;
+      var sg = sheet.getContext("2d"); sg.fillStyle = "#808080"; sg.fillRect(0, 0, sheet.width, th);
+      [pa.canvas, pb.canvas, dc].forEach(function (cv2, n) { sg.drawImage(cv2, n * (tw + 4), 0, tw, th); });
+      name = "a | b (reference) | diff";
+    }
+    var blob = await new Promise(function (res) { sheet.toBlob(res, "image/png"); });
+    images.push({ name: name, nodeId: "diff", width: sheet.width, height: sheet.height, bytes: new Uint8Array(await blob.arrayBuffer()) });
+  }
   return {
-    width: W, height: H, sizeB: [B.width, B.height],
-    aspectMismatch: Math.abs(W / H - B.width / B.height) > 0.02,
-    mismatch: Math.round(bad / (W * H) * 10000) / 10000,
-    meanDelta: Math.round(sum / (W * H) / 255 * 10000) / 10000,
-    diffBox: maxX >= 0 ? { x: minX, y: minY, w: maxX - minX + 1, h: maxY - minY + 1 } : null,
-    hotspots: hot,
-    images: [{ name: "diff (red = different)", nodeId: "diff", width: W, height: H, bytes: new Uint8Array(await blob.arrayBuffer()) }],
+    verdict: failed.length ? "FAIL" : "PASS", failed: failed, score: score,
+    metrics: {
+      mismatch: r(mismatch, 4), meanDeltaE: r(meanDE, 2), p95DeltaE: r(p95, 1), maxDeltaE: r(maxDE, 1), ssim: r(SSIM, 4),
+      lightnessBias: r(sumDL / N, 2),
+    },
+    limits: { tolerance: tol, maxMismatch: maxMismatch, maxMeanDeltaE: maxMeanDE, minSsim: minSsim, preset: p.preset || "normal" },
+    size: [r(rg.w / unit, 1), r(rg.h / unit, 1)], sizeB: [B.width, B.height], analyzedAt: [W, H], fit: fit,
+    aspectMismatch: aspectMismatch,
+    heatmap: heatmap, hotspots: hotspots,
+    images: images,
   };
 }
 

@@ -90,13 +90,14 @@ server.registerTool(
   "status",
   {
     description:
-      "Check whether the Figma plugin is connected and which file/page/selection it sees. Lists every connected file (one plugin window per open file); pass `use` (file name or connection id) to direct all following calls to that file. Call this first if anything fails.",
+      "Check whether the Figma plugin is connected and which file/page/selection it sees. Lists every connected file (one plugin window per open file); pass `use` (file name or connection id) to direct this agent's following calls to that file (other agent sessions keep their own target). Call this first if anything fails.",
     inputSchema: { use: z.string().optional().describe("Switch the target file: connection id or (part of) the file name.") },
   },
   ({ use }) =>
     run(async () => {
-      if (use) bridge.use(use);
-      if (!bridge.connected) {
+      if (use) await bridge.use(use);
+      const st = await bridge.state();
+      if (!st.connected) {
         return [
           text(
             bridge.listenError ??
@@ -105,7 +106,7 @@ server.registerTool(
         ];
       }
       const info = await bridge.call("info");
-      return [json({ connected: true, server: VERSION, ...info, connections: bridge.list() })];
+      return [json({ connected: true, server: VERSION, role: bridge.role, ...info, connections: st.connections })];
     })
 );
 
@@ -547,20 +548,31 @@ server.registerTool(
   "compare",
   {
     description:
-      "Visual diff: compares node `a` with `b` (another node id, a local PNG/JPG path, a URL or base64) pixel by pixel (b is resized to a). " +
-      "Returns mismatch ratio, mean delta, bounding box of differences, the worst 8×8-grid hotspots, and a diff image (red = different). Use it to check render_html against a browser screenshot, or a design against a reference.",
+      "Perceptual visual diff of candidate `a` against reference `b` (node id, local PNG/JPG path, URL or base64). Measures CIEDE2000 colour difference and SSIM, then returns a PASS/FAIL verdict against explicit tolerances, " +
+      "a ΔE heat-map grid, the worst cells with coordinates, both average colours and a plain-language hint (e.g. 'a is darker, less saturated than b'), and a diff image. " +
+      "Pick `preset` strict | normal (default) | loose, or override the individual limits. Iterate until verdict is PASS. Coordinates are in a's units, relative to a's top-left. Use `region` to check one part, `fit` when aspect ratios differ.",
     inputSchema: {
-      a: z.string().describe("Node id."),
-      b: z.string().describe("Node id, file path, URL or base64."),
+      a: z.string().describe("Candidate: node id."),
+      b: z.string().describe("Reference: node id, file path, URL or base64."),
       scale: z.number().min(0.1).max(2).optional().describe("Export scale for node sides (default 1)."),
-      threshold: z.number().min(0).max(1).optional().describe("Per-channel difference that counts as a mismatch (default 0.1)."),
+      preset: z.enum(["strict", "normal", "loose"]).optional().describe("Tolerance preset: strict (ΔE 2.3, ≤0.5% pixels, SSIM ≥ 0.98), normal (ΔE 5, ≤2%, SSIM ≥ 0.95), loose (ΔE 10, ≤8%, SSIM ≥ 0.85)."),
+      tolerance: z.number().min(0).max(100).optional().describe("Per-pixel ΔE2000 above which a pixel counts as different (≈2.3 is barely visible, 5 is visible at a glance)."),
+      maxMismatch: z.number().min(0).max(1).optional().describe("Maximum allowed share of different pixels (0–1)."),
+      maxMeanDeltaE: z.number().min(0).max(100).optional().describe("Maximum allowed mean ΔE over the image."),
+      minSsim: z.number().min(0).max(1).optional().describe("Minimum required structural similarity (0–1)."),
+      fit: z.enum(["stretch", "contain", "cover"]).optional().describe("How b is fitted into a's frame (default stretch; the result flags aspectMismatch)."),
+      region: z.object({ x: z.number(), y: z.number(), w: z.number(), h: z.number() }).optional().describe("Compare only this rectangle of a (a's units, relative to its top-left)."),
+      grid: z.number().int().min(2).max(24).optional().describe("Cells per side for heatmap/hotspots (default 8)."),
+      background: z.string().optional().describe("Colour that transparent pixels are composited on (default #ffffff)."),
+      images: z.enum(["diff", "all", "none"]).optional().describe("Returned image: diff heat-map (default), `all` = a | b | diff side by side, or none."),
     },
   },
   (a) =>
     run(async () => {
       const side = async (s: string) =>
         NODE_ID.test(s) ? { nodeId: s, scale: a.scale ?? 1 } : { base64: (await loadBinary(s)).toString("base64") };
-      return withImages(await bridge.call("compare", { a: await side(a.a), b: await side(a.b), threshold: a.threshold }, 120_000));
+      const { a: sa, b: sb, scale: _scale, ...opts } = a;
+      return withImages(await bridge.call("compare", { ...opts, a: await side(sa), b: await side(sb) }, 120_000));
     })
 );
 
