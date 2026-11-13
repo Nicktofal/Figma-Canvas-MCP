@@ -20,19 +20,22 @@ if %ERRORLEVEL% NEQ 0 (
 )
 
 echo.
-echo [2/2] Publishing figma-canvas-mcp to npm...
+echo [2/2] Publishing figma-canvas-mcp v0.2.0 to npm...
 echo.
-echo If prompted for "Enter OTP:" or one-time password,
-echo enter your 6-digit code from your authenticator app and press Enter.
+set /p OTP="Enter 6-digit 2FA code from your authenticator app (e.g. 123456): "
 echo.
 
-call npm.cmd publish --access public
+if "%OTP%"=="" (
+    call npm.cmd publish --access public
+) else (
+    call npm.cmd publish --access public --otp=%OTP%
+)
 
 echo.
 if %ERRORLEVEL% EQU 0 (
     color 0A
     echo ======================================================================
-    echo   [SUCCESS] Package figma-canvas-mcp successfully published to npm!
+    echo   [SUCCESS] Package figma-canvas-mcp v0.2.0 is LIVE on npm!
     echo.
     echo   Anyone can now run: npx -y figma-canvas-mcp
     echo ======================================================================
