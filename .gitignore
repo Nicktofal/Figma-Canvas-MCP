@@ -4,11 +4,3 @@ server/plugin/
 *.log
 figma-exports/
 figma-captures/
-.sharrowkin/
-claude.exe
-scripts/
-assets/diff.png
-assets/generated-banner.png
-assets/recreated-banner.png
-assets/concept-icon.jpg
-assets/ref.jpg
