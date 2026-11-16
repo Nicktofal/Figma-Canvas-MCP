@@ -438,21 +438,33 @@ function renderMesh(spec, W, H) {
         } else { V[k + 2] = c[0]; V[k + 3] = c[1]; V[k + 4] = c[2]; }
         V[k + 5] = c[3];
       }
-      // derivative of channel ch along u (columns, dir 0) or v (rows, dir 1) at node (r, c), per unit index step
-      function deriv(ch, r, c, dir) {
+      // Hermite tangents of channel ch at node (r, c) along u (columns, dir 0) or v (rows, dir 1): [toward the next node, from the previous node].
+      // Interior nodes use a chord-length Catmull-Rom, so uneven spacing (dense rows near an edge, sparse inside) stays well behaved;
+      // end nodes of an open grid line use the chord to their single neighbour; collapsed nodes fall back to an index-based average.
+      function tangents(ch, r, c, dir) {
         var cnt = dir ? R : C, i = dir ? r : c, wrap = dir ? wrapV : wrapU;
-        function g(ii) { if (wrap) ii = ((ii % cnt) + cnt) % cnt; return dir ? V[(ii * C + c) * 6 + ch] : V[(r * C + ii) * 6 + ch]; }
-        if (wrap) return (g(i + 1) - g(i - 1)) / 2;
-        if (cnt === 2) return g(1) - g(0);
-        if (i === 0) return ch < 2 ? (-3 * g(0) + 4 * g(1) - g(2)) / 2 : g(1) - g(0);
-        if (i === cnt - 1) return ch < 2 ? (3 * g(cnt - 1) - 4 * g(cnt - 2) + g(cnt - 3)) / 2 : g(cnt - 1) - g(cnt - 2);
-        return (g(i + 1) - g(i - 1)) / 2;
+        function at(ii) { if (wrap) ii = ((ii % cnt) + cnt) % cnt; return dir ? ii * C + c : r * C + ii; }
+        var iP = at(i - 1), iC = at(i), iN = at(i + 1), hasP = wrap || i > 0, hasN = wrap || i < cnt - 1;
+        var g0 = V[iC * 6 + ch];
+        if (!hasP) { var d = V[iN * 6 + ch] - g0; return [d, d]; }
+        if (!hasN) { var d2 = g0 - V[iP * 6 + ch]; return [d2, d2]; }
+        var gm = V[iP * 6 + ch], g1 = V[iN * 6 + ch];
+        var hL = Math.hypot(V[iC * 6] - V[iP * 6], V[iC * 6 + 1] - V[iP * 6 + 1]), hR = Math.hypot(V[iN * 6] - V[iC * 6], V[iN * 6 + 1] - V[iC * 6 + 1]);
+        var monotone = ch >= 2; // colours must not overshoot between nodes (no ringing next to a sharp rim); positions stay Catmull-Rom
+        if (hL > 1e-6 && hR > 1e-6) {
+          var sL = (g0 - gm) / hL, sR = (g1 - g0) / hR, vel;
+          if (monotone) vel = sL * sR > 0 ? 2 * sL * sR / (sL + sR) : 0; // harmonic mean of the two slopes, zero at extrema
+          else vel = (sR * hL + sL * hR) / (hL + hR);
+          return [vel * hR, vel * hL];
+        }
+        var sl0 = g0 - gm, sr0 = g1 - g0, m = monotone ? (sl0 * sr0 > 0 ? 2 * sl0 * sr0 / (sl0 + sr0) : 0) : (g1 - gm) / 2;
+        return [m, m];
       }
       for (var rr = 0; rr < R; rr++) for (var cc = 0; cc < C; cc++) {
         var kk = (rr * C + cc) * 6, nn = nodes[rr * C + cc];
         for (var ch = 0; ch < 6; ch++) {
-          var sm = ch < 2 ? spec.smooth : spec.colorSmooth, du = deriv(ch, rr, cc, 0) * sm, dv = deriv(ch, rr, cc, 1) * sm;
-          MuO[kk + ch] = MuI[kk + ch] = du; MvO[kk + ch] = MvI[kk + ch] = dv;
+          var sm = ch < 2 ? spec.smooth : spec.colorSmooth, tu = tangents(ch, rr, cc, 0), tv = tangents(ch, rr, cc, 1);
+          MuO[kk + ch] = tu[0] * sm; MuI[kk + ch] = tu[1] * sm; MvO[kk + ch] = tv[0] * sm; MvI[kk + ch] = tv[1] * sm;
         }
         // explicit bezier handles override the position tangents (handle = tangent / 3); one handle alone is mirrored
         var hr = nn.hr, hl = nn.hl, hd = nn.hd, hu = nn.hu;
