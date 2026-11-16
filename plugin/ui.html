@@ -236,6 +236,20 @@ onmessage = function (e) {
   } else if (m.type === "info") {
     setInfo(m.info);
     if (typeof fxRefresh === "function") fxRefresh();
+  } else if (m.type === "sample") {
+    // pixel sampling for h.halftone: decode PNG bytes on a canvas and hand back RGBA, downscaled to maxSide
+    createImageBitmap(new Blob([m.bytes])).then(function (bm) {
+      var s = Math.min(1, m.maxSide / Math.max(bm.width, bm.height));
+      var w = Math.max(1, Math.round(bm.width * s)), h = Math.max(1, Math.round(bm.height * s));
+      var c = document.createElement("canvas");
+      c.width = w; c.height = h;
+      var x = c.getContext("2d", { willReadFrequently: true });
+      x.drawImage(bm, 0, 0, w, h);
+      var d = x.getImageData(0, 0, w, h).data;
+      parent.postMessage({ pluginMessage: { type: "sample_reply", id: m.id, w: w, h: h, data: new Uint8Array(d.buffer) } }, "*");
+    }).catch(function (err) {
+      parent.postMessage({ pluginMessage: { type: "sample_reply", id: m.id, error: String((err && err.message) || err) } }, "*");
+    });
   } else if (m.type === "progress") {
     var pf = inflight[m.id];
     if (pf) sendProgress(pf.wsId, m.done, m.total, m.note);

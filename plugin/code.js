@@ -1156,6 +1156,232 @@ async function perspectiveTransform(node, o) {
   return res;
 }
 
+// ── grain, progressive blur, halftone ──
+
+function clampNum(v, def, lo, hi) { v = typeof v === "number" && isFinite(v) ? v : def; return Math.max(lo, Math.min(hi, v)); }
+
+/** Put a new node right above `node` in its parent (absolute inside auto-layout frames). */
+function placeAbove(node, nn) {
+  var par = node.parent;
+  par.insertChild(par.children.indexOf(node) + 1, nn);
+  if (par.layoutMode && par.layoutMode !== "NONE") { try { nn.layoutPositioning = "ABSOLUTE"; } catch (err) { /* older files */ } }
+  return nn;
+}
+
+/** Native Figma NOISE effect (live and editable in the Effects panel). */
+function noiseEffect(o) {
+  var a = clampNum(o.amount, 0.35, 0, 1), eff = {
+    type: "NOISE", visible: true, noiseSize: clampNum(o.size, 1, 0.1, 16), density: clampNum(o.density, 0.6, 0, 1),
+  };
+  var c1 = hexToRgba(o.color || "#000000");
+  if ((o.tone || "duo") === "mono") {
+    eff.noiseType = "MONOTONE";
+    eff.color = { r: c1.r, g: c1.g, b: c1.b, a: a };
+  } else {
+    var c2 = hexToRgba(o.color2 || "#ffffff");
+    eff.noiseType = "DUOTONE";
+    eff.color = { r: c1.r, g: c1.g, b: c1.b, a: a };
+    eff.secondaryColor = { r: c2.r, g: c2.g, b: c2.b, a: a };
+  }
+  return eff;
+}
+
+/**
+ * Film grain / noise using Figma's native NOISE effect. Frames, rectangles and groups get a full-size overlay layer
+ * ("Grain", neutral grey blended with OVERLAY so only the grain shows); other shapes get the effect directly.
+ * o: amount 0–1 (alpha, default .35) · size (grain px, default 1) · density 0–1 (default .6) · tone 'duo' (dark+light, default) | 'mono'
+ *    color / color2 (hex; mono uses color) · blend OVERLAY | SOFT_LIGHT | HARD_LIGHT · mode 'overlay' | 'direct' (default by node type)
+ */
+function makeGrain(node, o) {
+  o = o || {};
+  var eff = noiseEffect(o);
+  var mode = o.mode || ({ FRAME: 1, COMPONENT: 1, INSTANCE: 1, RECTANGLE: 1, GROUP: 1 }[node.type] ? "overlay" : "direct");
+  if (mode === "direct") {
+    if (!("effects" in node)) throw new Error("h.grain: this node cannot take effects; use mode 'overlay'");
+    node.effects = node.effects.concat([eff]);
+    return node;
+  }
+  var blend = ["OVERLAY", "SOFT_LIGHT", "HARD_LIGHT"].indexOf(o.blend) >= 0 ? o.blend : "OVERLAY";
+  var r = figma.createRectangle();
+  r.name = "Grain";
+  r.fills = [{ type: "SOLID", color: { r: 0.5, g: 0.5, b: 0.5 } }];
+  r.blendMode = blend;
+  r.effects = [eff];
+  r.locked = o.lock === true;
+  if (node.type === "FRAME" || node.type === "COMPONENT" || node.type === "INSTANCE") {
+    node.appendChild(r);
+    if (node.layoutMode && node.layoutMode !== "NONE") { try { r.layoutPositioning = "ABSOLUTE"; } catch (err) { /* older files */ } }
+    r.resize(node.width, node.height);
+    r.x = 0; r.y = 0;
+    r.constraints = { horizontal: "STRETCH", vertical: "STRETCH" };
+    if (typeof node.cornerRadius === "number") r.cornerRadius = node.cornerRadius;
+  } else {
+    placeAbove(node, r);
+    var b = parentBox(node);
+    r.resize(Math.max(0.01, b.w), Math.max(0.01, b.h));
+    r.x = b.x; r.y = b.y;
+    if (typeof node.cornerRadius === "number") r.cornerRadius = node.cornerRadius;
+  }
+  return r;
+}
+
+/**
+ * Progressive blur (native: blur strength ramps along an axis). h.progressiveBlur(node, {side:'bottom', radius:24})
+ * o: side — where the blur is strongest: 'top' | 'bottom' (default) | 'left' | 'right' · radius (px, default 24) · startRadius (default 0)
+ *    from / to — where the ramp begins and ends along the axis, 0–1 of the node (default 0 and 1) · background:true blurs what is behind
+ *    (frosted header fading out) instead of the layer itself · replace:true drops existing blurs first
+ */
+function makeProgressiveBlur(node, o) {
+  o = o || {};
+  if (!("effects" in node)) throw new Error("h.progressiveBlur: this node cannot take effects");
+  var side = o.side || "bottom", from = clampNum(o.from, 0, 0, 1), to = clampNum(o.to, 1, 0, 1);
+  var ax = { top: [0, 1], bottom: [0, 0], left: [1, 1], right: [1, 0] }[side];
+  if (!ax) throw new Error("h.progressiveBlur: side must be top | bottom | left | right");
+  // the ramp starts at `from` (weak end) and ends at `to` (strong end); for top/left the strong end is at 0
+  var p0 = ax[1] ? 1 - from : from, p1 = ax[1] ? 1 - to : to;
+  var s = ax[0] ? { x: p0, y: 0.5 } : { x: 0.5, y: p0 }, e = ax[0] ? { x: p1, y: 0.5 } : { x: 0.5, y: p1 };
+  var eff = {
+    type: o.background ? "BACKGROUND_BLUR" : "LAYER_BLUR", blurType: "PROGRESSIVE", visible: true,
+    radius: clampNum(o.radius, 24, 0, 250), startRadius: clampNum(o.startRadius, 0, 0, 250), startOffset: s, endOffset: e,
+  };
+  var keep = o.replace ? node.effects.filter(function (x) { return x.type !== "LAYER_BLUR" && x.type !== "BACKGROUND_BLUR"; }) : node.effects;
+  node.effects = keep.concat([eff]);
+  return node;
+}
+
+var SAMPLE_WAITERS = {}, SAMPLE_SEQ = 1;
+
+/** Decode PNG bytes in the plugin UI (it has a canvas) and get back RGBA pixels, downscaled to maxSide. */
+function sampleViaUI(bytes, maxSide) {
+  return new Promise(function (resolve, reject) {
+    var id = SAMPLE_SEQ++;
+    var t = setTimeout(function () { delete SAMPLE_WAITERS[id]; reject(new Error("pixel sampling timed out; keep the plugin window open")); }, 30000);
+    SAMPLE_WAITERS[id] = { resolve: resolve, reject: reject, t: t };
+    figma.ui.postMessage({ type: "sample", id: id, bytes: bytes, maxSide: maxSide });
+  });
+}
+
+/**
+ * Halftone of a layer, built as ONE vector of dots / squares / lines on a rotated grid.
+ * h.halftone(node, {cell: 8, shape: 'dot', color: '#111'})
+ * o: cell (grid pitch px, default 8) · shape 'dot' | 'square' | 'diamond' | 'line' (default dot) · angle (grid rotation °, default 45; 0 for lines)
+ *    color (ink hex, default #000000; 'source' = one ellipse per dot in the layer's own colours, max ~3000 dots)
+ *    invert (false: dark areas get big dots, for ink on light; true: light areas get big dots, for light dots on dark)
+ *    gamma (default 1; <1 grows dots) · contrast (default 1) · max (largest dot as a share of the cell, default 1.05)
+ *    bg (hex: adds a background rectangle) · keep (true keeps the original visible)
+ * Returns the vector (or the group when bg is set / color is 'source').
+ */
+async function makeHalftone(node, o) {
+  o = o || {};
+  if (!node || !node.parent || !("exportAsync" in node)) throw new Error("h.halftone: pass a node that lives on the canvas");
+  var shape = o.shape || "dot";
+  if (["dot", "square", "diamond", "line"].indexOf(shape) < 0) throw new Error("h.halftone: shape must be dot | square | diamond | line");
+  var box = parentBox(node), colored = o.color === "source";
+  var cell = clampNum(o.cell, 8, 1.5, 400);
+  cell = Math.max(cell, Math.sqrt((box.w * box.h) / (colored ? 3000 : 12000)));
+  var angle = clampNum(o.angle, shape === "line" ? 0 : 45, -360, 360) * Math.PI / 180, ca = Math.cos(angle), sa = Math.sin(angle);
+  var gamma = clampNum(o.gamma, 1, 0.1, 5), contrast = clampNum(o.contrast, 1, 0.1, 5), maxS = clampNum(o.max, 1.05, 0.1, 3), invert = !!o.invert;
+
+  // sample the layer: about three pixels per cell, at most 1024 px on the long side
+  var side = Math.min(1024, Math.max(32, Math.ceil(Math.max(box.w, box.h) / (cell / 3))));
+  var scale = side / Math.max(node.width, node.height, 1);
+  var bytes = await node.exportAsync({ format: "PNG", constraint: { type: "SCALE", value: Math.min(scale, 4) } });
+  var px = await sampleViaUI(bytes, side);
+  var data = px.data, iw = px.w, ih = px.h;
+  function at(u, v, k) {
+    var x = Math.max(0, Math.min(iw - 1, Math.floor(u * iw))), y = Math.max(0, Math.min(ih - 1, Math.floor(v * ih)));
+    return data[(y * iw + x) * 4 + k];
+  }
+  function sample(u, v) { // 3×3 mean (alpha-weighted colour) around the point
+    var du = 1 / iw, dv = 1 / ih, r = 0, g = 0, b = 0, a = 0;
+    for (var j = -1; j <= 1; j++) for (var i = -1; i <= 1; i++) {
+      var al = at(u + i * du, v + j * dv, 3) / 255;
+      r += at(u + i * du, v + j * dv, 0) * al; g += at(u + i * du, v + j * dv, 1) * al; b += at(u + i * du, v + j * dv, 2) * al; a += al;
+    }
+    if (a <= 0) return { r: 0, g: 0, b: 0, a: 0, lum: 1 };
+    r /= a; g /= a; b /= a;
+    return { r: r, g: g, b: b, a: a / 9, lum: (0.2126 * r + 0.7152 * g + 0.0722 * b) / 255 };
+  }
+
+  var cx = box.x + box.w / 2, cy = box.y + box.h / 2, n = Math.ceil(Math.sqrt(box.w * box.w + box.h * box.h) / 2 / cell) + 1;
+  var dots = [];
+  for (var j = -n; j <= n; j++) for (var i = -n; i <= n; i++) {
+    var X = cx + (i * ca - j * sa) * cell, Y = cy + (i * sa + j * ca) * cell;
+    if (X < box.x || X > box.x + box.w || Y < box.y || Y > box.y + box.h) continue;
+    var s = sample((X - box.x) / box.w, (Y - box.y) / box.h);
+    var d = Math.pow(Math.max(0, Math.min(1, invert ? s.lum : 1 - s.lum)), gamma);
+    d = Math.max(0, Math.min(1, (d - 0.5) * contrast + 0.5)) * s.a;
+    if (d < 0.02) continue;
+    dots.push({ x: X, y: Y, d: d, s: s });
+  }
+  if (!dots.length) throw new Error("h.halftone: nothing to draw (layer empty or fully " + (invert ? "dark" : "light") + "; try invert or gamma)");
+
+  function size(d) { // returns [lengthAlongAxis, thicknessAcross]
+    if (shape === "line") return [cell * 1.02, cell * maxS * d];
+    var e = cell * maxS * Math.sqrt(d);
+    return [e, e];
+  }
+  var result, parts = [];
+  if (colored) {
+    dots.forEach(function (p) {
+      var sz = size(p.d), w = sz[0], h = sz[1], r;
+      r = shape === "dot" ? figma.createEllipse() : figma.createRectangle();
+      node.parent.appendChild(r);
+      r.resize(Math.max(0.01, w), Math.max(0.01, h));
+      var rot = shape === "diamond" ? angle + Math.PI / 4 : angle, c = Math.cos(rot), s2 = Math.sin(rot);
+      r.relativeTransform = [[c, -s2, p.x - (c * w / 2 - s2 * h / 2)], [s2, c, p.y - (s2 * w / 2 + c * h / 2)]];
+      r.fills = [{ type: "SOLID", color: { r: p.s.r / 255, g: p.s.g / 255, b: p.s.b / 255 } }];
+      r.name = "dot";
+      parts.push(r);
+    });
+    result = figma.group(parts, node.parent);
+  } else {
+    var vertices = [], segments = [], loops = [], K = 0.5522847498;
+    dots.forEach(function (p) {
+      var sz = size(p.d), hx = sz[0] / 2, hy = sz[1] / 2, base = vertices.length, loop = [];
+      if (shape === "dot") {
+        var rr = hx;
+        for (var k = 0; k < 4; k++) vertices.push({ x: p.x + rr * Math.cos(k * Math.PI / 2), y: p.y + rr * Math.sin(k * Math.PI / 2) });
+        for (var q = 0; q < 4; q++) {
+          var t0 = q * Math.PI / 2, t1 = (q + 1) * Math.PI / 2;
+          segments.push({
+            start: base + q, end: base + (q + 1) % 4,
+            tangentStart: { x: -K * rr * Math.sin(t0), y: K * rr * Math.cos(t0) },
+            tangentEnd: { x: K * rr * Math.sin(t1), y: -K * rr * Math.cos(t1) },
+          });
+          loop.push(segments.length - 1);
+        }
+      } else {
+        var rot = shape === "diamond" ? angle + Math.PI / 4 : angle, c = Math.cos(rot), s2 = Math.sin(rot);
+        [[-hx, -hy], [hx, -hy], [hx, hy], [-hx, hy]].forEach(function (v) { vertices.push({ x: p.x + v[0] * c - v[1] * s2, y: p.y + v[0] * s2 + v[1] * c }); });
+        for (var m = 0; m < 4; m++) { segments.push({ start: base + m, end: base + (m + 1) % 4 }); loop.push(segments.length - 1); }
+      }
+      loops.push(loop);
+    });
+    var minX = Infinity, minY = Infinity;
+    vertices.forEach(function (v) { minX = Math.min(minX, v.x); minY = Math.min(minY, v.y); });
+    vertices.forEach(function (v) { v.x -= minX; v.y -= minY; });
+    var vec = figma.createVector();
+    placeAbove(node, vec);
+    vec.relativeTransform = [[1, 0, minX], [0, 1, minY]];
+    await vec.setVectorNetworkAsync({ vertices: vertices, segments: segments, regions: [{ windingRule: "NONZERO", loops: loops }] });
+    vec.fills = [H.solid(o.color || "#000000")];
+    vec.strokes = [];
+    vec.name = "Halftone";
+    result = vec;
+  }
+  if (o.bg) {
+    var bgr = figma.createRectangle();
+    node.parent.appendChild(bgr);
+    bgr.resize(box.w, box.h); bgr.x = box.x; bgr.y = box.y;
+    bgr.fills = [H.solid(o.bg)]; bgr.name = "bg";
+    result = figma.group([bgr, result], node.parent);
+  }
+  result.name = (node.name || "Layer") + " · halftone";
+  if (o.keep !== true) node.visible = false;
+  return result;
+}
+
 function recolorTree(n, color) {
   var paint = H.solid(color);
   if ("fills" in n && n.fills !== figma.mixed && n.fills.length) n.fills = n.fills.map(function (f) { return f.type === "IMAGE" ? f : paint; });
@@ -1362,6 +1588,12 @@ var H = {
   iso: isoTransform,
   /** True perspective: h.perspective(node, {shrink:'top', amount:0.35} | {quad:[TL,TR,BR,BL]}). Vector → warped vector, else image-tile mesh ({grid}). Original hidden unless {keep:true}. */
   perspective: perspectiveTransform,
+  /** Film grain via the native NOISE effect: h.grain(node, {amount:.35, size:1, density:.6, tone:'duo'|'mono', blend}). Frames/rects get a "Grain" overlay layer. */
+  grain: makeGrain,
+  /** Native progressive blur: h.progressiveBlur(node, {side:'bottom', radius:24, background?, from?, to?}). */
+  progressiveBlur: makeProgressiveBlur,
+  /** Halftone as one vector of dots/squares/lines: await h.halftone(node, {cell:8, shape:'dot', angle:45, color:'#111', invert?, bg?}). */
+  halftone: makeHalftone,
   /** Additive multi-radius bloom above the node (see makeGlow options). Returns the glow group. */
   glow: makeGlow,
   /** Re-tune a glow made by h.glow: h.glowUpdate(group, {intensity: 3}). Returns the rebuilt group (new id). */
@@ -2537,6 +2769,14 @@ figma.ui.onmessage = function (msg) {
 async function handleMessage(msg) {
   if (msg.type === "save_port") {
     figma.clientStorage.setAsync("port", msg.port);
+    return;
+  }
+  if (msg.type === "sample_reply") {
+    var w = SAMPLE_WAITERS[msg.id];
+    if (!w) return;
+    clearTimeout(w.t);
+    delete SAMPLE_WAITERS[msg.id];
+    if (msg.error) w.reject(new Error(msg.error)); else w.resolve({ w: msg.w, h: msg.h, data: msg.data });
     return;
   }
   if (msg.type === "notify") {

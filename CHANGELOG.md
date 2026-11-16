@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- New `execute` helpers, documented in the new `effects-texture` skill: `h.grain` (film grain through the native NOISE effect, overlay layer for frames), `h.progressiveBlur` (native progressive layer/background blur along an axis) and `h.halftone` (dots, squares, diamonds or lines from the layer's pixels, as one vector or coloured dots). Pixel sampling goes through the plugin UI (canvas), so the plugin window must stay open.
+
 ## 0.3.1
 
 - New `h.perspective(node, {shrink, amount} | {quad})`: true perspective with converging lines. Vector-like nodes become a warped vector (curves cut and re-fitted); frames, groups and images become an image-tile mesh. Documented in the `effects-glow-iso` skill.
