@@ -1117,10 +1117,17 @@ async function perspectiveRaster(node, f, box, o) {
       var r = figma.createRectangle();
       node.parent.appendChild(r); // tile coordinates are in the parent's space
       r.resize(Math.max(0.01, tw), Math.max(0.01, th));
-      r.relativeTransform = [
+      var D = [
         [(p1[0] - p0[0]) / tw, (p3[0] - p0[0]) / th, p0[0]],
         [(p1[1] - p0[1]) / tw, (p3[1] - p0[1]) / th, p0[1]],
       ];
+      r.relativeTransform = D;
+      // Figma keeps unit-length axes for a skewed node, so restore the edge lengths through the size (as in transformAround);
+      // resize keeps the top-left corner fixed
+      var A = r.relativeTransform;
+      var len = function (T, k) { return Math.sqrt(T[0][k] * T[0][k] + T[1][k] * T[1][k]); };
+      var fx = len(D, 0) / (len(A, 0) || 1), fy = len(D, 1) / (len(A, 1) || 1);
+      if (Math.abs(fx - 1) > 1e-3 || Math.abs(fy - 1) > 1e-3) r.resize(Math.max(0.01, tw * fx), Math.max(0.01, th * fy));
       r.fills = [{
         type: "IMAGE", imageHash: img.hash, scaleMode: "CROP",
         imageTransform: [[tw / w, 0, sx0 / w], [0, th / h, sy0 / h]],
@@ -1212,7 +1219,12 @@ function buildGlowGroup(node, o, parent, index, name) {
   if (!layers.length) throw new Error("glow settings produce no visible layers (intensity 0?)");
   var g = figma.group(layers, parent, index);
   g.name = name || "Glow";
-  if (parent.layoutMode && parent.layoutMode !== "NONE") { try { g.layoutPositioning = "ABSOLUTE"; } catch (err) { /* older files */ } }
+  if (parent.layoutMode && parent.layoutMode !== "NONE") {
+    try { g.layoutPositioning = "ABSOLUTE"; } catch (err) { /* older files */ }
+    // the group is laid out by the frame's flow before it turns absolute; move it back onto the source layer
+    var c0 = g.children[0], dx = node.absoluteTransform[0][2] - c0.absoluteTransform[0][2], dy = node.absoluteTransform[1][2] - c0.absoluteTransform[1][2];
+    if (Math.abs(dx) > 0.01 || Math.abs(dy) > 0.01) { g.x += dx; g.y += dy; }
+  }
   var saved = {};
   Object.keys(o).forEach(function (k) { if (k !== "name") saved[k] = o[k]; });
   g.setPluginData(GLOW_KEY, JSON.stringify({ src: node.id, opts: saved }));
