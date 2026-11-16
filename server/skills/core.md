@@ -12,7 +12,7 @@ Never ask the user questions you can answer yourself: pick sensible defaults, bu
 
 ## Tool choice
 `render_html` (HTML/Tailwind → Auto Layout/GRID) · `execute` (Plugin API; helpers `h`, data via `args`) · `motion` (native keyframes, exportable video) · `export` (files) · `to_code` (Figma → HTML/JSX) · `compare` (perceptual diff with PASS/FAIL verdict) · `prototype` (click/hover links) · `library` (team libraries) · `figma_rest` (comments, versions; needs FIGMA_TOKEN).
-Effects in `execute`: `h.glow` (bloom), `h.iso` (isometric), `h.transform` (skew/affine), `h.perspective` (see skill `effects-glow-iso`); `h.grain`, `h.progressiveBlur`, `h.halftone` (skill `effects-texture`).
+Effects in `execute`: `h.glow` (bloom), `h.iso` (isometric), `h.transform` (skew/affine), `h.perspective` (see skill `effects-glow-iso`); `h.grain`, `h.progressiveBlur`, `h.halftone` (skill `effects-texture`); `h.mesh` curved gradient mesh (skill `effects-mesh`).
 
 ## Plugin API pitfalls (execute)
 - Colours are 0–1 floats; use `h.solid('#hex')`. Fills/strokes/effects arrays are immutable: assign new arrays.

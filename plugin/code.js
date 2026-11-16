@@ -1261,6 +1261,25 @@ function sampleViaUI(bytes, maxSide) {
   });
 }
 
+/** 3×3-mean sampler over decoded RGBA pixels (from sampleViaUI): sample(u, v) with u, v in 0..1 → {r, g, b (0–255), a (0–1), lum (0–1)}. */
+function pixelSampler(px) {
+  var data = px.data, iw = px.w, ih = px.h;
+  function at(u, v, k) {
+    var x = Math.max(0, Math.min(iw - 1, Math.floor(u * iw))), y = Math.max(0, Math.min(ih - 1, Math.floor(v * ih)));
+    return data[(y * iw + x) * 4 + k];
+  }
+  return function (u, v) {
+    var du = 1 / iw, dv = 1 / ih, r = 0, g = 0, b = 0, a = 0;
+    for (var j = -1; j <= 1; j++) for (var i = -1; i <= 1; i++) {
+      var al = at(u + i * du, v + j * dv, 3) / 255;
+      r += at(u + i * du, v + j * dv, 0) * al; g += at(u + i * du, v + j * dv, 1) * al; b += at(u + i * du, v + j * dv, 2) * al; a += al;
+    }
+    if (a <= 0) return { r: 0, g: 0, b: 0, a: 0, lum: 1 };
+    r /= a; g /= a; b /= a;
+    return { r: r, g: g, b: b, a: a / 9, lum: (0.2126 * r + 0.7152 * g + 0.0722 * b) / 255 };
+  };
+}
+
 /**
  * Halftone of a layer, built as ONE vector of dots / squares / lines on a rotated grid.
  * h.halftone(node, {cell: 8, shape: 'dot', color: '#111'})
@@ -1287,21 +1306,7 @@ async function makeHalftone(node, o) {
   var scale = side / Math.max(node.width, node.height, 1);
   var bytes = await node.exportAsync({ format: "PNG", constraint: { type: "SCALE", value: Math.min(scale, 4) } });
   var px = await sampleViaUI(bytes, side);
-  var data = px.data, iw = px.w, ih = px.h;
-  function at(u, v, k) {
-    var x = Math.max(0, Math.min(iw - 1, Math.floor(u * iw))), y = Math.max(0, Math.min(ih - 1, Math.floor(v * ih)));
-    return data[(y * iw + x) * 4 + k];
-  }
-  function sample(u, v) { // 3×3 mean (alpha-weighted colour) around the point
-    var du = 1 / iw, dv = 1 / ih, r = 0, g = 0, b = 0, a = 0;
-    for (var j = -1; j <= 1; j++) for (var i = -1; i <= 1; i++) {
-      var al = at(u + i * du, v + j * dv, 3) / 255;
-      r += at(u + i * du, v + j * dv, 0) * al; g += at(u + i * du, v + j * dv, 1) * al; b += at(u + i * du, v + j * dv, 2) * al; a += al;
-    }
-    if (a <= 0) return { r: 0, g: 0, b: 0, a: 0, lum: 1 };
-    r /= a; g /= a; b /= a;
-    return { r: r, g: g, b: b, a: a / 9, lum: (0.2126 * r + 0.7152 * g + 0.0722 * b) / 255 };
-  }
+  var sample = pixelSampler(px);
 
   var cx = box.x + box.w / 2, cy = box.y + box.h / 2, n = Math.ceil(Math.sqrt(box.w * box.w + box.h * box.h) / 2 / cell) + 1;
   var dots = [];
@@ -1381,6 +1386,139 @@ async function makeHalftone(node, o) {
   result.name = (node.name || "Layer") + " · halftone";
   if (o.keep !== true) node.visible = false;
   return result;
+}
+
+// ── gradient mesh ──
+
+var MESH_KEY = "fcm_mesh";
+
+function meshColor(c) {
+  if (typeof c === "string") { var x = hexToRgba(c); return [x.r, x.g, x.b, x.a]; }
+  if (Array.isArray(c)) return [c[0], c[1], c[2], c[3] === undefined ? 1 : c[3]];
+  if (c && typeof c === "object") return [c.r, c.g, c.b, c.a === undefined ? 1 : c.a];
+  throw new Error("h.mesh: a colour is a hex string, [r,g,b(,a)] in 0–1 or {r,g,b,a}");
+}
+
+function meshVec(v, what) {
+  if (v === undefined || v === null) return null;
+  if (Array.isArray(v) && v.length === 2 && isFinite(v[0]) && isFinite(v[1])) return [v[0], v[1]];
+  if (v && isFinite(v.x) && isFinite(v.y)) return [v.x, v.y];
+  throw new Error("h.mesh: handle " + what + " must be [dx, dy]");
+}
+
+/**
+ * Normalise a mesh spec. Nodes are row-major (rows × cols); x, y are fractions of the target's box (0–1, may go outside);
+ * handles hl/hr/hu/hd are [dx, dy] bezier handle offsets in the same units (to the left/right/up/down neighbour).
+ */
+async function meshSpec(o) {
+  var cols = Math.round(o.cols || (o.grid && o.grid[0]) || 0), rows = Math.round(o.rows || (o.grid && o.grid[1]) || 0);
+  var src = o.nodes || null, colors = o.colors || null;
+  // rows of columns → flat row-major list; a colour like [r,g,b] has a number first, so it is not mistaken for a row
+  var rowsOf = function (a) { return a && a.length && Array.isArray(a[0]) && typeof a[0][0] !== "number" ? a : null; };
+  var cr = rowsOf(colors), nr = src && src.length && Array.isArray(src[0]) ? src : null;
+  if (cr) { rows = rows || cr.length; cols = cols || cr[0].length; colors = [].concat.apply([], cr); }
+  if (nr) { rows = rows || nr.length; cols = cols || nr[0].length; src = [].concat.apply([], nr); }
+  if (!cols || !rows) throw new Error("h.mesh: give cols and rows (node counts, each at least 2), or 2D arrays for colors / nodes");
+  if (cols < 2 || rows < 2) throw new Error("h.mesh: cols and rows must each be at least 2");
+  if (cols * rows > 4096) throw new Error("h.mesh: at most 4096 nodes");
+  var total = cols * rows;
+  if (src && src.length !== total) throw new Error("h.mesh: nodes has " + src.length + " entries, expected cols*rows = " + total + " (row-major)");
+  if (colors && colors.length !== total) throw new Error("h.mesh: colors has " + colors.length + " entries, expected cols*rows = " + total + " (row-major)");
+  var sampler = null;
+  if (o.from) {
+    var ref = typeof o.from === "string" ? await getNode(o.from) : o.from;
+    var side = Math.min(1024, Math.max(64, Math.round(Math.max(cols, rows) * 12)));
+    var bytes = await ref.exportAsync({ format: "PNG", constraint: { type: "SCALE", value: Math.min(4, side / Math.max(ref.width, ref.height, 1)) } });
+    sampler = pixelSampler(await sampleViaUI(bytes, side));
+  }
+  var nodes = [];
+  for (var r = 0; r < rows; r++) for (var c = 0; c < cols; c++) {
+    var i = r * cols + c, nd = src ? src[i] : {}, x = nd.x, y = nd.y;
+    if (typeof x !== "number") x = c / (cols - 1);
+    if (typeof y !== "number") y = r / (rows - 1);
+    var col = null;
+    if (nd.color !== undefined) col = meshColor(nd.color);
+    else if (colors) col = meshColor(colors[i]);
+    else if (sampler) { var sm = sampler(x, y); col = [sm.r / 255, sm.g / 255, sm.b / 255, sm.a]; }
+    if (!col) throw new Error("h.mesh: node " + i + " has no colour (give colors, nodes[].color or from)");
+    if (typeof nd.alpha === "number") col[3] = nd.alpha;
+    var out = { x: x, y: y, c: col.map(function (v) { return Math.round(v * 10000) / 10000; }) };
+    ["hl", "hr", "hu", "hd"].forEach(function (k) { var v = meshVec(nd[k], k); if (v) out[k] = v; });
+    nodes.push(out);
+  }
+  var wrap = String(o.wrap || "").toLowerCase().replace(/[^uv]/g, "");
+  return {
+    cols: cols, rows: rows, nodes: nodes, wrap: wrap,
+    smooth: clampNum(o.smooth, 1, 0, 1.5), colorSmooth: clampNum(o.colorSmooth, 1, 0, 1.5),
+    space: o.space === "srgb" ? "srgb" : "oklab",
+  };
+}
+
+/** Render a normalised mesh spec to PNG bytes in the plugin UI (it has a canvas). */
+function renderMeshViaUI(spec, W, H) {
+  return new Promise(function (resolve, reject) {
+    var id = SAMPLE_SEQ++;
+    var t = setTimeout(function () { delete SAMPLE_WAITERS[id]; reject(new Error("mesh rendering timed out; keep the plugin window open")); }, 120000);
+    SAMPLE_WAITERS[id] = { resolve: resolve, reject: reject, t: t };
+    figma.ui.postMessage({ type: "mesh", id: id, spec: spec, W: W, H: H });
+  });
+}
+
+/**
+ * Gradient mesh, Illustrator-style: a grid of nodes (position + colour + optional bezier handles) joined by smooth bicubic
+ * patches, so grid lines can be curved. The mesh becomes an image fill of the layer (its outline, strokes and effects stay).
+ *   await h.mesh(node, { cols: 3, rows: 3, colors: ['#f6d365', …9 colours, row-major] })           regular grid
+ *   await h.mesh(node, { cols, rows, nodes: [{x, y, color, alpha, hl, hr, hu, hd}, …row-major] })   curved / moved nodes
+ *   await h.mesh(node, { cols: 16, rows: 16, from: referenceNode })                                colours sampled from a layer
+ * o: wrap 'u' | 'v' | 'uv' (rows / columns / both close into a loop: rings, discs, spheres) · smooth 0–1.5 (shape tangents, default 1,
+ *    0 = straight lines) · colorSmooth 0–1.5 (default 1, 0 = flat-ish) · space 'oklab' (default) | 'srgb' · scale (pixels per px,
+ *    default 2) · append (true adds the mesh above the layer's other fills; by default it replaces them) · name. Re-running on the same layer replaces its mesh in place; h.meshGet / h.meshUpdate edit it.
+ */
+async function makeMesh(node, o) {
+  o = o || {};
+  if (!node || !("fills" in node)) throw new Error("h.mesh: pass a layer that can have fills (frame, rectangle, ellipse, vector…)");
+  var spec = await meshSpec(o);
+  var w = Math.max(1, node.width), h = Math.max(1, node.height);
+  var sc = clampNum(o.scale, Math.min(2, 2048 / Math.max(w, h)), 0.05, 8);
+  var W = Math.max(8, Math.min(4096, Math.round(w * sc))), Hh = Math.max(8, Math.min(4096, Math.round(h * sc)));
+  var res = await renderMeshViaUI(spec, W, Hh);
+  var img = figma.createImage(res.data);
+  var paint = { type: "IMAGE", imageHash: img.hash, scaleMode: "FILL" };
+  var prev = readMesh(node), fills = node.fills === figma.mixed ? [] : node.fills.slice();
+  var at = prev ? fills.findIndex(function (f) { return f.type === "IMAGE" && f.imageHash === prev.hash; }) : -1;
+  if (at >= 0 && o.append !== false) fills[at] = paint;      // re-running replaces the old mesh in place
+  else if (o.append) fills.push(paint);
+  else fills = [paint];
+  node.fills = fills;
+  node.setPluginData(MESH_KEY, JSON.stringify({ spec: spec, hash: img.hash, scale: sc }));
+  if (o.name) node.name = o.name;
+  return node;
+}
+
+function readMesh(node) {
+  if (!node || !node.getPluginData) return null;
+  var raw = node.getPluginData(MESH_KEY);
+  if (!raw) return null;
+  try { var d = JSON.parse(raw); return d && d.spec ? d : null; } catch (e) { return null; }
+}
+
+/** The stored (normalised) mesh spec of a layer made by h.mesh, or null. Handy to inspect or tweak: nodes[i].c is [r,g,b,a] in 0–1. */
+function meshGet(node) { var d = readMesh(node); return d ? d.spec : null; }
+
+/** Change a stored mesh and re-render: h.meshUpdate(node, {nodes: [...] | colors: [...] | smooth: 0.6 …}). Unspecified parts are kept. */
+async function meshUpdate(node, patch) {
+  var d = readMesh(node);
+  if (!d) throw new Error("h.meshUpdate: this layer has no mesh made by h.mesh");
+  var s = d.spec, p = patch || {};
+  var o = { cols: p.cols || s.cols, rows: p.rows || s.rows, wrap: p.wrap !== undefined ? p.wrap : s.wrap, smooth: p.smooth !== undefined ? p.smooth : s.smooth,
+    colorSmooth: p.colorSmooth !== undefined ? p.colorSmooth : s.colorSmooth, space: p.space || s.space, scale: p.scale !== undefined ? p.scale : d.scale, from: p.from };
+  var keep = (o.cols === s.cols && o.rows === s.rows);
+  var base = keep ? s.nodes.map(function (n) { var m = { x: n.x, y: n.y, color: n.c }; ["hl", "hr", "hu", "hd"].forEach(function (k) { if (n[k]) m[k] = n[k]; }); return m; }) : null;
+  if (p.nodes) {
+    o.nodes = p.nodes.map(function (n, i) { var b = base ? base[i] || {} : {}; return Object.assign({}, b, n); });
+  } else if (base) o.nodes = base;
+  if (p.colors) o.colors = p.colors;
+  return makeMesh(node, o);
 }
 
 function recolorTree(n, color) {
@@ -1595,6 +1733,12 @@ var H = {
   progressiveBlur: makeProgressiveBlur,
   /** Halftone as one vector of dots/squares/lines: await h.halftone(node, {cell:8, shape:'dot', angle:45, color:'#111', invert?, bg?}). */
   halftone: makeHalftone,
+  /** Illustrator-style gradient mesh as an image fill: await h.mesh(node, {cols, rows, colors | nodes:[{x,y,color,hl,hr,hu,hd}] | from:refNode, wrap, smooth}). See skill effects-mesh. */
+  mesh: makeMesh,
+  /** The stored mesh spec of a layer made by h.mesh. */
+  meshGet: meshGet,
+  /** Edit and re-render a mesh: await h.meshUpdate(node, {nodes:[{color:'#fff'}, …] | colors | smooth}). */
+  meshUpdate: meshUpdate,
   /** Additive multi-radius bloom above the node (see makeGlow options). Returns the glow group. */
   glow: makeGlow,
   /** Re-tune a glow made by h.glow: h.glowUpdate(group, {intensity: 3}). Returns the rebuilt group (new id). */

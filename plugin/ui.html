@@ -250,6 +250,16 @@ onmessage = function (e) {
     }).catch(function (err) {
       parent.postMessage({ pluginMessage: { type: "sample_reply", id: m.id, error: String((err && err.message) || err) } }, "*");
     });
+  } else if (m.type === "mesh") {
+    try {
+      renderMesh(m.spec, m.W, m.H).then(function (bytes) {
+        parent.postMessage({ pluginMessage: { type: "sample_reply", id: m.id, w: m.W, h: m.H, data: bytes } }, "*");
+      }).catch(function (err) {
+        parent.postMessage({ pluginMessage: { type: "sample_reply", id: m.id, error: String((err && err.message) || err) } }, "*");
+      });
+    } catch (err) {
+      parent.postMessage({ pluginMessage: { type: "sample_reply", id: m.id, error: String((err && err.message) || err) } }, "*");
+    }
   } else if (m.type === "progress") {
     var pf = inflight[m.id];
     if (pf) sendProgress(pf.wsId, m.done, m.total, m.note);
@@ -389,6 +399,168 @@ async function insertAsset(p) {
     return toPlugin("place_video", { bytes: bytesFromBase64(p.base64), width: p.width, height: p.height, name: p.name, x: p.x, y: p.y, parentId: p.parentId, targetNodeId: p.targetNodeId });
   }
   throw new Error("Unknown asset kind " + p.kind);
+}
+
+// ════════════════════════════════════════════════════════════════════
+//  Gradient mesh renderer (h.mesh)
+//  Nodes → bicubic Hermite patches (zero twist) with Catmull-Rom default tangents or explicit bezier handles;
+//  every patch is cut into a fine grid of triangles that are Gouraud-filled in Oklab, then PNG-encoded.
+// ════════════════════════════════════════════════════════════════════
+var MESH_LIN2SRGB = (function () {
+  var t = new Uint8Array(4096);
+  for (var i = 0; i < 4096; i++) {
+    var l = i / 4095, v = l <= 0.0031308 ? 12.92 * l : 1.055 * Math.pow(l, 1 / 2.4) - 0.055;
+    t[i] = Math.round(Math.max(0, Math.min(1, v)) * 255);
+  }
+  return t;
+})();
+function meshSrgbToLin(v) { return v <= 0.04045 ? v / 12.92 : Math.pow((v + 0.055) / 1.055, 2.4); }
+
+function renderMesh(spec, W, H) {
+  return new Promise(function (resolve, reject) {
+    try {
+      if (W * H > 12e6) throw new Error("mesh image would be " + W + "×" + H + " px; lower scale");
+      var C = spec.cols, R = spec.rows, N = C * R, nodes = spec.nodes;
+      var wrapU = spec.wrap.indexOf("u") >= 0, wrapV = spec.wrap.indexOf("v") >= 0, oklab = spec.space !== "srgb";
+      var V = new Float64Array(N * 6), MuO = new Float64Array(N * 6), MuI = new Float64Array(N * 6), MvO = new Float64Array(N * 6), MvI = new Float64Array(N * 6);
+      for (var n = 0; n < N; n++) {
+        var nd = nodes[n], c = nd.c, k = n * 6;
+        if (!(isFinite(nd.x) && isFinite(nd.y))) throw new Error("mesh node " + n + " has a non-numeric position");
+        V[k] = nd.x * W; V[k + 1] = nd.y * H;
+        if (oklab) {
+          var r = meshSrgbToLin(c[0]), g = meshSrgbToLin(c[1]), b = meshSrgbToLin(c[2]);
+          var l_ = Math.cbrt(0.4122214708 * r + 0.5363325363 * g + 0.0514459929 * b);
+          var m_ = Math.cbrt(0.2119034982 * r + 0.6806995451 * g + 0.1073969566 * b);
+          var s_ = Math.cbrt(0.0883024619 * r + 0.2817188376 * g + 0.6299787005 * b);
+          V[k + 2] = 0.2104542553 * l_ + 0.7936177850 * m_ - 0.0040720468 * s_;
+          V[k + 3] = 1.9779984951 * l_ - 2.4285922050 * m_ + 0.4505937099 * s_;
+          V[k + 4] = 0.0259040371 * l_ + 0.7827717662 * m_ - 0.8086757660 * s_;
+        } else { V[k + 2] = c[0]; V[k + 3] = c[1]; V[k + 4] = c[2]; }
+        V[k + 5] = c[3];
+      }
+      // derivative of channel ch along u (columns, dir 0) or v (rows, dir 1) at node (r, c), per unit index step
+      function deriv(ch, r, c, dir) {
+        var cnt = dir ? R : C, i = dir ? r : c, wrap = dir ? wrapV : wrapU;
+        function g(ii) { if (wrap) ii = ((ii % cnt) + cnt) % cnt; return dir ? V[(ii * C + c) * 6 + ch] : V[(r * C + ii) * 6 + ch]; }
+        if (wrap) return (g(i + 1) - g(i - 1)) / 2;
+        if (cnt === 2) return g(1) - g(0);
+        if (i === 0) return ch < 2 ? (-3 * g(0) + 4 * g(1) - g(2)) / 2 : g(1) - g(0);
+        if (i === cnt - 1) return ch < 2 ? (3 * g(cnt - 1) - 4 * g(cnt - 2) + g(cnt - 3)) / 2 : g(cnt - 1) - g(cnt - 2);
+        return (g(i + 1) - g(i - 1)) / 2;
+      }
+      for (var rr = 0; rr < R; rr++) for (var cc = 0; cc < C; cc++) {
+        var kk = (rr * C + cc) * 6, nn = nodes[rr * C + cc];
+        for (var ch = 0; ch < 6; ch++) {
+          var sm = ch < 2 ? spec.smooth : spec.colorSmooth, du = deriv(ch, rr, cc, 0) * sm, dv = deriv(ch, rr, cc, 1) * sm;
+          MuO[kk + ch] = MuI[kk + ch] = du; MvO[kk + ch] = MvI[kk + ch] = dv;
+        }
+        // explicit bezier handles override the position tangents (handle = tangent / 3); one handle alone is mirrored
+        var hr = nn.hr, hl = nn.hl, hd = nn.hd, hu = nn.hu;
+        if (hr || hl) {
+          if (hr) { MuO[kk] = 3 * hr[0] * W; MuO[kk + 1] = 3 * hr[1] * H; if (!hl) { MuI[kk] = MuO[kk]; MuI[kk + 1] = MuO[kk + 1]; } }
+          if (hl) { MuI[kk] = -3 * hl[0] * W; MuI[kk + 1] = -3 * hl[1] * H; if (!hr) { MuO[kk] = MuI[kk]; MuO[kk + 1] = MuI[kk + 1]; } }
+        }
+        if (hd || hu) {
+          if (hd) { MvO[kk] = 3 * hd[0] * W; MvO[kk + 1] = 3 * hd[1] * H; if (!hu) { MvI[kk] = MvO[kk]; MvI[kk + 1] = MvO[kk + 1]; } }
+          if (hu) { MvI[kk] = -3 * hu[0] * W; MvI[kk + 1] = -3 * hu[1] * H; if (!hd) { MvO[kk] = MvI[kk]; MvO[kk + 1] = MvI[kk + 1]; } }
+        }
+      }
+
+      var acc = new Float32Array(W * H * 4), MAXN = 64, buf = new Float32Array((MAXN + 1) * (MAXN + 1) * 6);
+      var EPS = 0.01;
+      function tri(a, b, c) {
+        var ax = buf[a], ay = buf[a + 1], bx = buf[b], by = buf[b + 1], cx = buf[c], cy = buf[c + 1];
+        var minx = Math.max(0, Math.floor(Math.min(ax, bx, cx) - 0.5)), maxx = Math.min(W - 1, Math.ceil(Math.max(ax, bx, cx) - 0.5));
+        var miny = Math.max(0, Math.floor(Math.min(ay, by, cy) - 0.5)), maxy = Math.min(H - 1, Math.ceil(Math.max(ay, by, cy) - 0.5));
+        if (minx > maxx || miny > maxy) return;
+        var den = (by - cy) * (ax - cx) + (cx - bx) * (ay - cy);
+        if (Math.abs(den) < 1e-9) return;
+        var inv = 1 / den;
+        for (var y = miny; y <= maxy; y++) {
+          var py = y + 0.5;
+          for (var x = minx; x <= maxx; x++) {
+            var px = x + 0.5;
+            var w0 = ((by - cy) * (px - cx) + (cx - bx) * (py - cy)) * inv, w1 = ((cy - ay) * (px - cx) + (ax - cx) * (py - cy)) * inv, w2 = 1 - w0 - w1;
+            if (w0 < -EPS || w1 < -EPS || w2 < -EPS) continue;
+            var o = (y * W + x) * 4;
+            acc[o] = w0 * buf[a + 2] + w1 * buf[b + 2] + w2 * buf[c + 2];
+            acc[o + 1] = w0 * buf[a + 3] + w1 * buf[b + 3] + w2 * buf[c + 3];
+            acc[o + 2] = w0 * buf[a + 4] + w1 * buf[b + 4] + w2 * buf[c + 4];
+            acc[o + 3] = w0 * buf[a + 5] + w1 * buf[b + 5] + w2 * buf[c + 5];
+          }
+        }
+      }
+
+      var PR = wrapV ? R : R - 1, PC = wrapU ? C : C - 1;
+      function cornersOf(pr, pc) {
+        var r1 = (pr + 1) % R, c1 = (pc + 1) % C;
+        return [(pr * C + pc) * 6, (pr * C + c1) * 6, (r1 * C + pc) * 6, (r1 * C + c1) * 6]; // index B*2+A: A = column side, B = row side
+      }
+      // Subdivision counts are shared per patch column (NNu) and per patch row (NNv), so neighbouring patches cut their common
+      // edge at the same points and leave no cracks.
+      var NNu = [], NNv = [];
+      for (var z = 0; z < PC; z++) NNu.push(3);
+      for (var z2 = 0; z2 < PR; z2++) NNv.push(3);
+      for (var pr0 = 0; pr0 < PR; pr0++) for (var pc0 = 0; pc0 < PC; pc0++) {
+        var k4 = cornersOf(pr0, pc0);
+        var lu = Math.max(Math.hypot(V[k4[0]] - V[k4[1]], V[k4[0] + 1] - V[k4[1] + 1]), Math.hypot(V[k4[2]] - V[k4[3]], V[k4[2] + 1] - V[k4[3] + 1]));
+        var lv = Math.max(Math.hypot(V[k4[0]] - V[k4[2]], V[k4[0] + 1] - V[k4[2] + 1]), Math.hypot(V[k4[1]] - V[k4[3]], V[k4[1] + 1] - V[k4[3] + 1]));
+        NNu[pc0] = Math.max(NNu[pc0], Math.min(MAXN, Math.ceil(lu * 1.3 / 5)));
+        NNv[pr0] = Math.max(NNv[pr0], Math.min(MAXN, Math.ceil(lv * 1.3 / 5)));
+      }
+      for (var pr = 0; pr < PR; pr++) for (var pc = 0; pc < PC; pc++) {
+        var cn = cornersOf(pr, pc), NU = NNu[pc], NV = NNv[pr];
+        for (var jj = 0; jj <= NV; jj++) {
+          var t = jj / NV, t2 = t * t, t3 = t2 * t;
+          var ht = [2 * t3 - 3 * t2 + 1, -2 * t3 + 3 * t2, t3 - 2 * t2 + t, t3 - t2]; // value@0, value@1, tangent@0, tangent@1
+          for (var ii = 0; ii <= NU; ii++) {
+            var s = ii / NU, s2 = s * s, s3 = s2 * s;
+            var hs = [2 * s3 - 3 * s2 + 1, -2 * s3 + 3 * s2, s3 - 2 * s2 + s, s3 - s2];
+            var vo = (jj * (NU + 1) + ii) * 6;
+            for (var ch2 = 0; ch2 < 6; ch2++) {
+              var val = 0;
+              for (var B = 0; B < 2; B++) for (var A = 0; A < 2; A++) {
+                var kk2 = cn[B * 2 + A] + ch2;
+                var mu = A ? MuI[kk2] : MuO[kk2], mv = B ? MvI[kk2] : MvO[kk2];
+                val += V[kk2] * hs[A] * ht[B] + mu * hs[2 + A] * ht[B] + mv * hs[A] * ht[2 + B];
+              }
+              buf[vo + ch2] = val;
+            }
+          }
+        }
+        for (var cj = 0; cj < NV; cj++) for (var ci = 0; ci < NU; ci++) {
+          var i00 = (cj * (NU + 1) + ci) * 6, i10 = i00 + 6, i01 = ((cj + 1) * (NU + 1) + ci) * 6, i11 = i01 + 6;
+          tri(i00, i10, i01);
+          tri(i10, i11, i01);
+        }
+      }
+
+      var out = new Uint8ClampedArray(W * H * 4);
+      for (var p = 0, q3 = 0; p < W * H; p++, q3 += 4) {
+        var a = acc[q3 + 3];
+        if (!(a > 0.002)) continue;
+        var rc = acc[q3], gc = acc[q3 + 1], bc = acc[q3 + 2], R8, G8, B8;
+        if (oklab) {
+          var l1 = rc + 0.3963377774 * gc + 0.2158037573 * bc, m1 = rc - 0.1055613458 * gc - 0.0638541728 * bc, s1 = rc - 0.0894841775 * gc - 1.2914855480 * bc;
+          l1 = l1 * l1 * l1; m1 = m1 * m1 * m1; s1 = s1 * s1 * s1;
+          var lr = 4.0767416621 * l1 - 3.3077115913 * m1 + 0.2309699292 * s1;
+          var lg = -1.2684380046 * l1 + 2.6097574011 * m1 - 0.3413193965 * s1;
+          var lb = -0.0041960863 * l1 - 0.7034186147 * m1 + 1.7076147010 * s1;
+          R8 = MESH_LIN2SRGB[Math.max(0, Math.min(4095, Math.round(lr * 4095)))];
+          G8 = MESH_LIN2SRGB[Math.max(0, Math.min(4095, Math.round(lg * 4095)))];
+          B8 = MESH_LIN2SRGB[Math.max(0, Math.min(4095, Math.round(lb * 4095)))];
+        } else { R8 = rc * 255; G8 = gc * 255; B8 = bc * 255; }
+        out[q3] = R8; out[q3 + 1] = G8; out[q3 + 2] = B8; out[q3 + 3] = Math.min(1, a) * 255;
+      }
+      var cv = document.createElement("canvas");
+      cv.width = W; cv.height = H;
+      cv.getContext("2d").putImageData(new ImageData(out, W, H), 0, 0);
+      cv.toBlob(function (blob) {
+        if (!blob) return reject(new Error("could not encode the mesh image"));
+        blob.arrayBuffer().then(function (ab) { resolve(new Uint8Array(ab)); }, reject);
+      }, "image/png");
+    } catch (e) { reject(e); }
+  });
 }
 
 // ════════════════════════════════════════════════════════════════════

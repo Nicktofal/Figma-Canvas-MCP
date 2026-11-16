@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- New `h.mesh` (with `h.meshGet`, `h.meshUpdate`): Illustrator-style gradient mesh. Nodes carry position, colour, alpha and optional bezier handles, joined by bicubic patches, so grid lines can be curved; `wrap` closes the grid into rings, discs and spheres; colours can be sampled from another layer (`from`). Rendered in the plugin UI (Oklab, crack-free tessellation) and applied as an image fill, so the layer keeps its outline. Skill `effects-mesh`.
 - New `execute` helpers, documented in the new `effects-texture` skill: `h.grain` (film grain through the native NOISE effect, overlay layer for frames), `h.progressiveBlur` (native progressive layer/background blur along an axis) and `h.halftone` (dots, squares, diamonds or lines from the layer's pixels, as one vector or coloured dots). Pixel sampling goes through the plugin UI (canvas), so the plugin window must stay open.
 
 ## 0.3.1
