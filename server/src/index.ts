@@ -8,7 +8,7 @@ import { Bridge, type Progress } from "./bridge.js";
 import { loadSkills } from "./skills.js";
 import { ffmpegArgs, findFfmpeg, run as ffmpegRun } from "./media.js";
 
-const VERSION = "0.2.0";
+const VERSION = "0.3.0";
 const PORT = Number(process.env.FIGMA_MCP_PORT ?? 3055);
 const bridge = new Bridge(PORT);
 await bridge.start();

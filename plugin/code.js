@@ -935,7 +935,20 @@ function transformAround(node, m) {
   var cx = T0[0][0] * w / 2 + T0[0][1] * h / 2 + T0[0][2], cy = T0[1][0] * w / 2 + T0[1][1] * h / 2 + T0[1][2];
   var M = [[m[0], m[2], 0], [m[1], m[3], 0]];
   var toC = [[1, 0, cx], [0, 1, cy]], fromC = [[1, 0, -cx], [0, 1, -cy]];
-  node.relativeTransform = mulAffine(toC, mulAffine(M, mulAffine(fromC, T0)));
+  var D = mulAffine(toC, mulAffine(M, mulAffine(fromC, T0)));
+  node.relativeTransform = D;
+  // Figma stores skew with unit-length axis columns, so the edge lengths of the skewed side shrink back
+  // (a 0.4 rad x-skew would come out 8% too short vertically). Restore them through the node size.
+  var A = node.relativeTransform;
+  var len = function (T, i) { return Math.sqrt(T[0][i] * T[0][i] + T[1][i] * T[1][i]); };
+  var sx = len(D, 0) / (len(A, 0) || 1), sy = len(D, 1) / (len(A, 1) || 1);
+  if (Math.abs(sx - 1) > 1e-3 || Math.abs(sy - 1) > 1e-3) {
+    node.resize(Math.max(0.01, w * sx), Math.max(0.01, h * sy));
+    var B = node.relativeTransform, w2 = node.width, h2 = node.height;
+    var cx2 = B[0][0] * w2 / 2 + B[0][1] * h2 / 2 + B[0][2], cy2 = B[1][0] * w2 / 2 + B[1][1] * h2 / 2 + B[1][2];
+    var tx = cx - cx2, ty = cy - cy2;
+    node.relativeTransform = [[B[0][0], B[0][1], B[0][2] + tx], [B[1][0], B[1][1], B[1][2] + ty]];
+  }
   return node;
 }
 
