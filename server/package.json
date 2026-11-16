@@ -1,6 +1,6 @@
 {
   "name": "figma-canvas-mcp",
-  "version": "0.3.1",
+  "version": "0.4.0",
   "description": "Figma Canvas MCP: the open, full-access Canvas engine for AI agents in Figma (Auto Layout, CSS Grid, Motion timeline, and atomic JS REPL).",
   "type": "module",
   "license": "MIT",
