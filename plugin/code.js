@@ -1372,7 +1372,8 @@ async function makeHalftone(node, o) {
   }
   if (o.bg) {
     var bgr = figma.createRectangle();
-    node.parent.appendChild(bgr);
+    result.parent.insertChild(result.parent.children.indexOf(result), bgr); // directly below the dots
+    if (result.parent.layoutMode && result.parent.layoutMode !== "NONE") { try { bgr.layoutPositioning = "ABSOLUTE"; } catch (err) { /* older files */ } }
     bgr.resize(box.w, box.h); bgr.x = box.x; bgr.y = box.y;
     bgr.fills = [H.solid(o.bg)]; bgr.name = "bg";
     result = figma.group([bgr, result], node.parent);
