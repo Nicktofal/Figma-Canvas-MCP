@@ -41,6 +41,19 @@
   button { font: inherit; padding: 3px 9px; border-radius: 4px; border: 1px solid var(--figma-color-border, #ccc); background: transparent; color: inherit; cursor: pointer; }
   button:hover { background: var(--figma-color-bg-hover, rgba(128,128,128,.12)); }
   [hidden] { display: none !important; }
+  .tabs { display: flex; border-bottom: 1px solid var(--figma-color-border, #e5e5e5); }
+  .tabs button { flex: 1; border: 0; border-radius: 0; padding: 8px 0; font-weight: 600; color: var(--figma-color-text-secondary, #777); border-bottom: 2px solid transparent; }
+  .tabs button.on { color: var(--figma-color-text, #222); border-bottom-color: var(--figma-color-border-brand, #0d99ff); }
+  .tabs .pip { display: inline-block; width: 6px; height: 6px; margin-left: 5px; border-radius: 50%; background: var(--figma-color-bg-brand, #0d99ff); vertical-align: middle; }
+  .fx { display: grid; grid-template-columns: 62px 1fr 38px; align-items: center; gap: 6px 8px; margin: 0; }
+  .fx input[type=range] { width: 100%; padding: 0; margin: 0; accent-color: var(--figma-color-bg-brand, #0d99ff); }
+  .fx output { text-align: right; font-variant-numeric: tabular-nums; }
+  .fx select { grid-column: 2 / 4; font: inherit; padding: 2px 4px; background: transparent; color: inherit; border: 1px solid var(--figma-color-border, #ccc); border-radius: 4px; }
+  .fx .tint { grid-column: 2 / 4; display: flex; align-items: center; gap: 8px; }
+  .fx input[type=color] { width: 28px; height: 20px; padding: 0; border: 1px solid var(--figma-color-border, #ccc); background: transparent; }
+  .btns { display: flex; gap: 6px; margin-top: 12px; }
+  .btns button.primary { background: var(--figma-color-bg-brand, #0d99ff); border-color: transparent; color: #fff; }
+  #fxMsg { padding: 20px 14px; line-height: 1.5; }
 </style>
 </head>
 <body>
@@ -57,6 +70,12 @@
   <span class="ver muted mono" id="ver"></span>
 </header>
 
+<nav class="tabs">
+  <button id="tabMain" class="on">Connection</button>
+  <button id="tabGlow">Glow<span class="pip" id="fxPip" hidden></span></button>
+</nav>
+
+<div id="paneMain">
 <section>
   <div class="state"><span class="dot" id="dot"></span><span id="state">Waiting for MCP server</span></div>
   <dl>
@@ -89,6 +108,28 @@
   <div class="set">Port <input id="port" type="number" min="1024" max="65535" value="3055"><button id="apply">Reconnect</button></div>
   <div class="set"><button id="copy">Copy debug info</button><span class="muted" id="copied"></span></div>
 </details>
+</div>
+
+<div id="paneGlow" hidden>
+  <div id="fxMsg" class="muted"></div>
+  <section id="fxBox" hidden>
+    <h2 id="fxTitle">Glow</h2>
+    <div class="fx">
+      <span>Radius</span><input type="range" id="fx_radius" min="1" max="300" step="1"><output id="o_radius"></output>
+      <span>Intensity</span><input type="range" id="fx_intensity" min="0" max="6" step="0.05"><output id="o_intensity"></output>
+      <span>Spread</span><input type="range" id="fx_spread" min="0" max="1" step="0.01"><output id="o_spread"></output>
+      <span>Core</span><input type="range" id="fx_core" min="0" max="3" step="0.05"><output id="o_core"></output>
+      <span>Steps</span><input type="range" id="fx_steps" min="3" max="8" step="1"><output id="o_steps"></output>
+      <span>Blend</span><select id="fx_blend"><option value="LINEAR_DODGE">Linear dodge (hot)</option><option value="SCREEN">Screen (soft)</option></select>
+      <span>Tint</span><label class="tint"><input type="checkbox" id="fx_tint"><input type="color" id="fx_color" value="#ff2bd6"><span class="muted">override colour</span></label>
+    </div>
+    <div class="btns"><button id="fxReset">Reset</button><button id="fxRebuild" title="Rebuild from the source layer (after you edited it)">Rebuild</button></div>
+  </section>
+  <section id="fxAdd" hidden>
+    <div id="fxAddText"></div>
+    <div class="btns"><button class="primary" id="fxAddBtn">Add glow</button></div>
+  </section>
+</div>
 
 <script>
 "use strict";
@@ -194,6 +235,7 @@ onmessage = function (e) {
     connect();
   } else if (m.type === "info") {
     setInfo(m.info);
+    if (typeof fxRefresh === "function") fxRefresh();
   } else if (m.type === "progress") {
     var pf = inflight[m.id];
     if (pf) sendProgress(pf.wsId, m.done, m.total, m.note);
@@ -1715,6 +1757,119 @@ window.__convert = async function (p) { // test hook
   toPlugin = function (m, params) { out = params; return Promise.resolve({}); };
   try { await renderHtml(p); } finally { toPlugin = orig; }
   return out;
+};
+
+
+// ════════════════════════════════════════════════════════════════════
+//  Glow tab: tune a glow group live
+// ════════════════════════════════════════════════════════════════════
+var fx = { mode: "none", id: null, opts: null, defaults: null, name: "", source: null, pending: null, endFlag: false, started: false, busy: false, dragging: false, wasGlow: false };
+var FX_NUM = ["radius", "intensity", "spread", "core", "steps"];
+
+function showTab(name) {
+  var g = name === "glow";
+  $("paneMain").hidden = g;
+  $("paneGlow").hidden = !g;
+  $("tabMain").className = g ? "" : "on";
+  $("tabGlow").className = g ? "on" : "";
+  if (g) fxRefresh();
+}
+$("tabMain").onclick = function () { showTab("main"); };
+$("tabGlow").onclick = function () { showTab("glow"); };
+
+function fmt(k, v) { return k === "radius" || k === "steps" ? String(Math.round(v)) : String(Math.round(v * 100) / 100); }
+
+function fxError(e) {
+  $("fxMsg").hidden = false;
+  $("fxMsg").textContent = String((e && e.message) || e);
+}
+
+function fxRender() {
+  var glow = fx.mode === "glow", add = fx.mode === "add";
+  $("fxPip").hidden = !(glow || add);
+  $("fxBox").hidden = !glow;
+  $("fxAdd").hidden = !add;
+  $("fxMsg").hidden = glow || add;
+  if (!glow && !add) $("fxMsg").textContent = "Select a layer to add a glow, or select a Glow group to tune it. Glows made by your agent with h.glow show up here too.";
+  if (add) $("fxAddText").textContent = "Add a glow to “" + fx.name + "”?";
+  if (glow) {
+    $("fxTitle").textContent = fx.source ? "Glow · source: " + fx.source : "Glow · source layer missing";
+    FX_NUM.forEach(function (k) { $("fx_" + k).value = fx.opts[k]; $("o_" + k).textContent = fmt(k, fx.opts[k]); });
+    $("fx_blend").value = fx.opts.blend;
+    $("fx_tint").checked = !!fx.opts.color;
+    if (fx.opts.color) $("fx_color").value = fx.opts.color;
+  }
+}
+
+async function fxRefresh() {
+  if (fx.dragging || fx.busy || fx.pending) return;
+  try {
+    var r = await toPlugin("glow_get", {});
+    if (fx.dragging || fx.busy || fx.pending) return;
+    fx.mode = r.mode; fx.id = r.id || null; fx.opts = r.opts || null; fx.defaults = r.defaults; fx.name = r.name; fx.source = r.source;
+    var becameGlow = r.mode === "glow" && !fx.wasGlow;
+    fx.wasGlow = r.mode === "glow";
+    fxRender();
+    if (becameGlow && !$("paneMain").hidden) showTab("glow");
+  } catch (e) {}
+}
+
+function fxQueue(patch, isEnd) {
+  if (fx.mode !== "glow") return;
+  fx.pending = fx.pending || {};
+  Object.keys(patch).forEach(function (k) { fx.opts[k] = patch[k]; fx.pending[k] = patch[k]; });
+  if (isEnd) fx.endFlag = true;
+  fxPump();
+}
+
+async function fxPump() {
+  if (fx.busy || !fx.pending) return;
+  fx.busy = true;
+  var patch = fx.pending, end = fx.endFlag;
+  fx.pending = null; fx.endFlag = false;
+  var phase = end ? (fx.started ? "end" : "both") : (fx.started ? "live" : "start");
+  fx.started = !end;
+  try {
+    var r = await toPlugin("glow_set", { id: fx.id, patch: patch, phase: phase });
+    fx.id = r.id;
+  } catch (e) {
+    fx.started = false;
+    fxError(e);
+  }
+  fx.busy = false;
+  if (fx.pending) fxPump(); else if (!fx.dragging) fxRefresh();
+}
+
+FX_NUM.forEach(function (k) {
+  var el = $("fx_" + k);
+  el.addEventListener("pointerdown", function () { fx.dragging = true; });
+  el.addEventListener("input", function () {
+    var v = Number(el.value);
+    $("o_" + k).textContent = fmt(k, v);
+    var p = {}; p[k] = v; fxQueue(p, false);
+  });
+  el.addEventListener("change", function () {
+    fx.dragging = false;
+    var p = {}; p[k] = Number(el.value); fxQueue(p, true);
+  });
+});
+$("fx_blend").onchange = function () { fxQueue({ blend: $("fx_blend").value }, true); };
+function fxTint() { fxQueue({ color: $("fx_tint").checked ? $("fx_color").value : null }, true); }
+$("fx_tint").onchange = fxTint;
+$("fx_color").onchange = function () { if ($("fx_tint").checked) fxTint(); };
+$("fxReset").onclick = function () {
+  var d = fx.defaults;
+  if (!d) return;
+  fxQueue({ radius: d.radius, intensity: d.intensity, spread: d.spread, core: d.core, steps: d.steps, blend: d.blend, color: null }, true);
+  fxRender();
+};
+$("fxRebuild").onclick = function () { fxQueue({}, true); };
+$("fxAddBtn").onclick = async function () {
+  try {
+    await toPlugin("glow_add", { id: fx.id, opts: {} });
+    fx.mode = "none"; fx.wasGlow = false;
+    await fxRefresh();
+  } catch (e) { fxError(e); }
 };
 
 parent.postMessage({ pluginMessage: { type: "ui_ready" } }, "*");

@@ -974,42 +974,97 @@ function recolorTree(n, color) {
   if ("children" in n) n.children.forEach(function (c) { recolorTree(c, color); });
 }
 
-/**
- * Deep-Glow-style bloom: a stack of blurred copies whose radii double from a tight core to `radius`,
- * blended additively (LINEAR_DODGE) above the source. Returns the group holding the glow layers.
- * o: radius (px, widest blur, default 48) · intensity (strength, default 1) · spread 0..1 (0 = tight core, 1 = wide haze, default 0.5)
- *    steps (octaves, 3–8, default 5) · color (override tint, hex) · blend (LINEAR_DODGE | SCREEN, default LINEAR_DODGE) · name
- */
-function makeGlow(node, o) {
+var GLOW_KEY = "fcm_glow";
+var GLOW_DEFAULTS = { radius: 48, intensity: 1, spread: 0.5, core: 1, steps: 5, color: null, blend: "LINEAR_DODGE" };
+
+function glowOpts(o) {
   o = o || {};
-  var radius = o.radius === undefined ? 48 : o.radius, intensity = o.intensity === undefined ? 1 : o.intensity;
-  var spread = Math.max(0, Math.min(1, o.spread === undefined ? 0.5 : o.spread));
-  var steps = Math.max(3, Math.min(8, Math.round(o.steps === undefined ? 5 : o.steps)));
-  var blend = o.blend || "LINEAR_DODGE", e = (spread - 0.5) * 2;
-  var parent = node.parent, index = parent.children.indexOf(node);
-  var layers = [], weights = [], radii = [];
-  for (var k = 0; k < steps; k++) {
-    var r = radius / Math.pow(2, steps - 1 - k);
+  var d = GLOW_DEFAULTS, out = {};
+  function num(v, def, lo, hi) { v = typeof v === "number" && isFinite(v) ? v : def; return Math.max(lo, Math.min(hi, v)); }
+  out.radius = num(o.radius, d.radius, 0.5, 600);
+  out.intensity = num(o.intensity, d.intensity, 0, 8);
+  out.spread = num(o.spread, d.spread, 0, 1);
+  out.core = num(o.core, d.core, 0, 4);
+  out.steps = Math.round(num(o.steps, d.steps, 3, 8));
+  out.color = o.color || null;
+  out.blend = o.blend === "SCREEN" ? "SCREEN" : "LINEAR_DODGE";
+  if (o.name) out.name = o.name;
+  return out;
+}
+
+/** The blurred, additively blended copies that make up a glow (not yet grouped). */
+function glowLayers(node, o) {
+  var e = (o.spread - 0.5) * 2, layers = [], weights = [], radii = [];
+  for (var k = 0; k < o.steps; k++) {
+    var r = o.radius / Math.pow(2, o.steps - 1 - k);
     radii.push(r);
-    weights.push(Math.pow(r / radius, e));
+    // `core` boosts the two tightest octaves, so the hot centre can be tuned apart from the haze
+    weights.push(Math.pow(r / o.radius, e) * (k < 2 ? o.core : 1));
   }
   var wmax = Math.max.apply(null, weights);
-  for (var i = 0; i < steps; i++) {
-    var total = intensity * (weights[i] / wmax) * 0.55, copies = Math.max(1, Math.min(4, Math.ceil(total)));
+  if (wmax <= 0) wmax = 1;
+  for (var i = 0; i < o.steps; i++) {
+    var total = o.intensity * (weights[i] / wmax) * 0.85, copies = Math.max(1, Math.min(6, Math.ceil(total)));
+    if (total <= 0) continue;
     for (var c = 0; c < copies; c++) {
       var cl = node.clone();
       cl.name = "glow " + Math.round(radii[i]) + "px";
       if (o.color) recolorTree(cl, o.color);
       cl.effects = [{ type: "LAYER_BLUR", radius: Math.max(0.5, radii[i]), visible: true }];
-      cl.blendMode = blend;
+      cl.blendMode = o.blend;
       cl.opacity = Math.min(1, total / copies);
       layers.push(cl);
     }
   }
-  var g = figma.group(layers, parent, index + 1);
-  g.name = o.name || "Glow";
+  return layers;
+}
+
+function buildGlowGroup(node, o, parent, index, name) {
+  var layers = glowLayers(node, o);
+  if (!layers.length) throw new Error("glow settings produce no visible layers (intensity 0?)");
+  var g = figma.group(layers, parent, index);
+  g.name = name || "Glow";
   if (parent.layoutMode && parent.layoutMode !== "NONE") { try { g.layoutPositioning = "ABSOLUTE"; } catch (err) { /* older files */ } }
+  var saved = {};
+  Object.keys(o).forEach(function (k) { if (k !== "name") saved[k] = o[k]; });
+  g.setPluginData(GLOW_KEY, JSON.stringify({ src: node.id, opts: saved }));
   return g;
+}
+
+/**
+ * Deep-Glow-style bloom: a stack of blurred copies whose radii double from a tight core to `radius`,
+ * blended additively (LINEAR_DODGE) above the source. Returns the group holding the glow layers; its settings
+ * are stored on the group, so the plugin's Glow tab (or h.glowUpdate) can re-tune it later.
+ * o: radius (px, widest blur, default 48) · intensity (strength 0–8, default 1) · spread 0..1 (0 = tight, 1 = wide haze, default 0.5)
+ *    core 0–4 (extra weight of the two tightest octaves, default 1) · steps (octaves, 3–8, default 5)
+ *    color (override tint, hex) · blend (LINEAR_DODGE | SCREEN, default LINEAR_DODGE) · name
+ */
+function makeGlow(node, o) {
+  var opts = glowOpts(o), parent = node.parent;
+  return buildGlowGroup(node, opts, parent, parent.children.indexOf(node) + 1, (o && o.name) || "Glow");
+}
+
+function readGlow(g) {
+  if (!g || g.type !== "GROUP") return null;
+  var raw = g.getPluginData(GLOW_KEY);
+  if (!raw) return null;
+  try { var d = JSON.parse(raw); return d && d.src ? d : null; } catch (e) { return null; }
+}
+
+/** Rebuild a glow group from its source with new settings (merged over the stored ones). Returns the new group. */
+async function updateGlow(g, patch) {
+  var d = readGlow(g);
+  if (!d) throw new Error("not a glow group made by h.glow");
+  var src = await figma.getNodeByIdAsync(d.src);
+  if (!src || src.removed) throw new Error("the glow's source layer no longer exists");
+  var merged = {};
+  Object.keys(d.opts).forEach(function (k) { merged[k] = d.opts[k]; });
+  Object.keys(patch || {}).forEach(function (k) { merged[k] = patch[k]; });
+  var opts = glowOpts(merged), parent = g.parent, index = parent.children.indexOf(g);
+  var ng = buildGlowGroup(src, opts, parent, index, g.name);
+  ng.visible = g.visible; ng.locked = g.locked;
+  g.remove();
+  return ng;
 }
 
 /** Small helper library exposed to `execute` code as `h`. */
@@ -1107,6 +1162,8 @@ var H = {
   iso: isoTransform,
   /** Additive multi-radius bloom above the node (see makeGlow options). Returns the glow group. */
   glow: makeGlow,
+  /** Re-tune a glow made by h.glow: h.glowUpdate(group, {intensity: 3}). Returns the rebuilt group (new id). */
+  glowUpdate: updateGlow,
   progress: function (done, total, note) { progress(done, total, note); },
   /** Call another bridge command from code, e.g. h.run('motion', {op:'animate', …}) — batches several commands into one undo step. */
   run: function (method, params) {
@@ -2113,6 +2170,45 @@ async function doInfo() {
   };
 }
 
+// Glow tab (plugin UI): edit a glow group's settings live. These are user edits, not bridge operations, so they
+// stay out of the MCP history; commitUndo keeps one slider drag as one Figma undo step.
+function insideGlow(n) {
+  for (var p = n.parent; p && p.type !== "PAGE"; p = p.parent) if (readGlow(p)) return true;
+  return false;
+}
+
+async function doGlowGet() {
+  var sel = figma.currentPage.selection;
+  if (sel.length !== 1) return { mode: "none", defaults: GLOW_DEFAULTS };
+  var n = sel[0], d = readGlow(n);
+  if (d) {
+    var src = await figma.getNodeByIdAsync(d.src);
+    return { mode: "glow", id: n.id, opts: glowOpts(d.opts), defaults: GLOW_DEFAULTS, source: src && !src.removed ? src.name : null };
+  }
+  if (n.type === "PAGE" || n.type === "DOCUMENT" || !("clone" in n) || insideGlow(n)) return { mode: "none", defaults: GLOW_DEFAULTS };
+  return { mode: "add", id: n.id, name: n.name, defaults: GLOW_DEFAULTS };
+}
+
+async function doGlowSet(p) {
+  var g = await figma.getNodeByIdAsync(p.id);
+  if (!g) throw new Error("glow group not found");
+  if (p.phase === "start" || p.phase === "both") figma.commitUndo();
+  var ng = await updateGlow(g, p.patch);
+  figma.currentPage.selection = [ng];
+  if (p.phase === "end" || p.phase === "both") figma.commitUndo();
+  return { id: ng.id, opts: glowOpts(readGlow(ng).opts) };
+}
+
+async function doGlowAdd(p) {
+  var n = await figma.getNodeByIdAsync(p.id);
+  if (!n) throw new Error("layer not found");
+  figma.commitUndo();
+  var g = makeGlow(n, p.opts || {});
+  figma.currentPage.selection = [g];
+  figma.commitUndo();
+  return { id: g.id };
+}
+
 async function doInsertSvg(p) {
   var node = figma.createNodeFromSvg(p.svg);
   if (p.name) node.name = p.name;
@@ -2202,6 +2298,9 @@ var HANDLERS = {
   library: doLibrary,
   history: doHistory,
   page: doPage,
+  glow_get: doGlowGet,
+  glow_set: doGlowSet,
+  glow_add: doGlowAdd,
 };
 
 var MUTATING = { execute: 1, build_tree: 1, insert_svg: 1, place_image: 1, place_video: 1, prototype: 1, library: 1 };
