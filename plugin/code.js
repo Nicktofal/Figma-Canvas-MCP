@@ -1490,16 +1490,39 @@ async function makeMesh(node, o) {
   else if (o.append) fills.push(paint);
   else fills = [paint];
   node.fills = fills;
-  node.setPluginData(MESH_KEY, JSON.stringify({ spec: spec, hash: img.hash, scale: sc }));
+  var stored = packMesh(spec, img.hash, sc);
+  // pluginData entries are capped at 100 kB: big meshes drop the stored nodes (the mesh itself is unaffected, only h.meshGet / h.meshUpdate are lost)
+  try { node.setPluginData(MESH_KEY, stored.length < 95000 ? stored : JSON.stringify({ spec: { cols: spec.cols, rows: spec.rows, tooBig: true }, hash: img.hash, scale: sc })); } catch (e) { /* too large */ }
   if (o.name) node.name = o.name;
   return node;
+}
+
+/** Compact stored form: nodes as [x, y, r, g, b, a, handles?] arrays with rounded numbers. */
+function packMesh(spec, hash, scale) {
+  var r4 = function (v) { return Math.round(v * 10000) / 10000; };
+  var nodes = spec.nodes.map(function (n) {
+    var row = [r4(n.x), r4(n.y), r4(n.c[0]), r4(n.c[1]), r4(n.c[2]), r4(n.c[3])], hs = {};
+    ["hl", "hr", "hu", "hd"].forEach(function (k) { if (n[k]) hs[k] = [r4(n[k][0]), r4(n[k][1])]; });
+    if (Object.keys(hs).length) row.push(hs);
+    return row;
+  });
+  return JSON.stringify({ spec: { cols: spec.cols, rows: spec.rows, wrap: spec.wrap, smooth: spec.smooth, colorSmooth: spec.colorSmooth, space: spec.space, nodes: nodes }, hash: hash, scale: scale });
 }
 
 function readMesh(node) {
   if (!node || !node.getPluginData) return null;
   var raw = node.getPluginData(MESH_KEY);
   if (!raw) return null;
-  try { var d = JSON.parse(raw); return d && d.spec ? d : null; } catch (e) { return null; }
+  try {
+    var d = JSON.parse(raw);
+    if (!d || !d.spec) return null;
+    if (d.spec.nodes) d.spec.nodes = d.spec.nodes.map(function (a) {
+      var n = { x: a[0], y: a[1], c: [a[2], a[3], a[4], a[5]] };
+      if (a[6]) Object.keys(a[6]).forEach(function (k) { n[k] = a[6][k]; });
+      return n;
+    });
+    return d;
+  } catch (e) { return null; }
 }
 
 /** The stored (normalised) mesh spec of a layer made by h.mesh, or null. Handy to inspect or tweak: nodes[i].c is [r,g,b,a] in 0–1. */
@@ -1509,6 +1532,7 @@ function meshGet(node) { var d = readMesh(node); return d ? d.spec : null; }
 async function meshUpdate(node, patch) {
   var d = readMesh(node);
   if (!d) throw new Error("h.meshUpdate: this layer has no mesh made by h.mesh");
+  if (d.spec.tooBig) throw new Error("h.meshUpdate: this mesh is too big to keep its nodes (over 100 kB); call h.mesh again with the full spec");
   var s = d.spec, p = patch || {};
   var o = { cols: p.cols || s.cols, rows: p.rows || s.rows, wrap: p.wrap !== undefined ? p.wrap : s.wrap, smooth: p.smooth !== undefined ? p.smooth : s.smooth,
     colorSmooth: p.colorSmooth !== undefined ? p.colorSmooth : s.colorSmooth, space: p.space || s.space, scale: p.scale !== undefined ? p.scale : d.scale, from: p.from };
