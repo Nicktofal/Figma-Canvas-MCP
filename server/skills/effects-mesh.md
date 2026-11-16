@@ -46,6 +46,11 @@ await h.mesh(h.node(args.ellipse), { cols, rows, nodes: ball, wrap: 'u' });
 ## Editing
 `h.meshGet(node)` returns the stored spec (`nodes[i].c` is `[r,g,b,a]`); `await h.meshUpdate(node, patch)` changes it and re-renders: `{colors: [...]}`, `{smooth: .5}`, or `{nodes: [{color:'#fff'}, {}, …]}` where each entry is merged into the existing node (same grid size).
 
+## Limits
+- Figma stores at most 100 kB of plugin data per layer entry. The mesh spec is kept there (compactly) so `h.meshGet` / `h.meshUpdate` work; very large meshes (roughly 1500+ nodes) exceed it and then **drop the stored nodes**: the mesh still renders, only `h.meshGet` / `h.meshUpdate` stop working (`tooBig`). Workaround: keep the spec in your own script and call `h.mesh` again to change it, or use fewer nodes. Rarely do you need more than a few hundred.
+- Ring meshes (`wrap`) need few columns (32–96) but many rows only near sharp features; spend rows where colour changes fast (an edge rim), not evenly.
+- The image is rendered at `scale` px per layer px, at most 4096 px per side and 12 M pixels in total.
+
 ## How to get a realistic result
 - Use the shape's own outline: one mesh per shape (petal, cheek, sky band), as in an Illustrator illustration. Fill the layer, do not put a mesh over everything.
 - Put nodes where the colour changes (highlight, core shadow, reflected light), not on a uniform grid. A few well-placed nodes beat many.
