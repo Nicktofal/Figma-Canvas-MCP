@@ -39,4 +39,15 @@ const top = h.iso(h.node(args.top), 'top');
 
 ## `h.transform(node, [a, b, c, d])`: any affine warp
 `x' = a·x + c·y`, `y' = b·x + d·y`, around the node centre. Skew X by angle t: `[1, 0, Math.tan(t), 1]`. Skew Y: `[1, Math.tan(t), 0, 1]`. Flip: `[-1, 0, 0, 1]`.
-Figma only supports affine matrices, so a true perspective (converging lines) is not possible on a live layer; approximate it with a trapezoid vector path.
+Figma layers are affine only, so converging lines need `h.perspective` below.
+
+## `await h.perspective(node, opts)`: true perspective
+Warps a node so parallel lines converge. Target shape: `{shrink:'top'|'bottom'|'left'|'right', amount:0.35}` (keystone: that edge gets `amount` narrower, 0–0.95; `skew` adds a lean) or an exact `{quad:[TL,TR,BR,BL]}` in the node's parent coordinates.
+- Vector-like nodes (vector, rectangle, ellipse, polygon, star, line, boolean, text) become a warped **vector**: crisp, fills and strokes kept, curves cut into `cuts` pieces (default 10).
+- Frames, groups, instances and images become a mesh of image tiles (`grid`, default 16×16, up to 64; `scale` export scale, default 2). Pixels, not live layers.
+- The original is hidden unless `keep:true`. Returns the new node (named "… · perspective"). Strokes keep their width; the warp is not applied to effects.
+
+```js
+const card = h.node(args.id);
+await h.perspective(card, { shrink: 'top', amount: 0.4 });
+```

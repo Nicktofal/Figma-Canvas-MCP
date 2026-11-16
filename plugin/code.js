@@ -967,6 +967,187 @@ function isoTransform(node, face, o) {
   return transformAround(node, [m[0] * s, m[1] * s, m[2] * s, m[3] * s]);
 }
 
+// ── true perspective ──
+
+/** Projective map from the unit square to the quad q = [TL, TR, BR, BL] (Heckbert). Returns f(u, v) → [x, y]. */
+function quadMap(q) {
+  var x0 = q[0][0], y0 = q[0][1], x1 = q[1][0], y1 = q[1][1], x2 = q[2][0], y2 = q[2][1], x3 = q[3][0], y3 = q[3][1];
+  var sx = x0 - x1 + x2 - x3, sy = y0 - y1 + y2 - y3, g = 0, hh = 0;
+  if (Math.abs(sx) > 1e-9 || Math.abs(sy) > 1e-9) {
+    var dx1 = x1 - x2, dx2 = x3 - x2, dy1 = y1 - y2, dy2 = y3 - y2, den = dx1 * dy2 - dx2 * dy1;
+    if (Math.abs(den) < 1e-12) throw new Error("h.perspective: the target quad is degenerate (collinear corners)");
+    g = (sx * dy2 - dx2 * sy) / den;
+    hh = (dx1 * sy - sx * dy1) / den;
+  }
+  var a = x1 - x0 + g * x1, b = x3 - x0 + hh * x3, d = y1 - y0 + g * y1, e = y3 - y0 + hh * y3;
+  return function (u, v) {
+    var w = g * u + hh * v + 1;
+    return [(a * u + b * v + x0) / w, (d * u + e * v + y0) / w];
+  };
+}
+
+/** Parent-space bounding box of a node (honours rotation), used as the source rectangle of the warp. */
+function parentBox(node) {
+  var T = node.relativeTransform, w = node.width, h = node.height, xs = [], ys = [];
+  [[0, 0], [w, 0], [w, h], [0, h]].forEach(function (p) {
+    xs.push(T[0][0] * p[0] + T[0][1] * p[1] + T[0][2]);
+    ys.push(T[1][0] * p[0] + T[1][1] * p[1] + T[1][2]);
+  });
+  var x = Math.min.apply(null, xs), y = Math.min.apply(null, ys);
+  return { x: x, y: y, w: Math.max.apply(null, xs) - x, h: Math.max.apply(null, ys) - y };
+}
+
+/** Target quad from opts.quad (4 points, parent space) or opts.shrink ('top'|'bottom'|'left'|'right') + opts.amount (0–0.95) + opts.skew. */
+function perspectiveQuad(box, o) {
+  var q = o.quad || o.corners;
+  if (q) {
+    if (!Array.isArray(q) || q.length !== 4) throw new Error("h.perspective: quad must be 4 points [TL, TR, BR, BL]");
+    return q.map(function (p) { return Array.isArray(p) ? [p[0], p[1]] : [p.x, p.y]; });
+  }
+  var x = box.x, y = box.y, w = box.w, h = box.h;
+  var amt = Math.max(0, Math.min(0.95, o.amount === undefined ? 0.3 : o.amount));
+  var side = o.shrink || "top";
+  var q2 = [[x, y], [x + w, y], [x + w, y + h], [x, y + h]];
+  var dx = (w * amt) / 2, dy = (h * amt) / 2;
+  if (side === "top") { q2[0][0] += dx; q2[1][0] -= dx; }
+  else if (side === "bottom") { q2[3][0] += dx; q2[2][0] -= dx; }
+  else if (side === "left") { q2[0][1] += dy; q2[3][1] -= dy; }
+  else if (side === "right") { q2[1][1] += dy; q2[2][1] -= dy; }
+  else throw new Error("h.perspective: shrink must be top | bottom | left | right");
+  if (o.skew) q2.forEach(function (p) { p[0] += o.skew * (p[1] - (y + h / 2)); });
+  return q2;
+}
+
+var PERSPECTIVE_VECTOR_TYPES = { VECTOR: 1, RECTANGLE: 1, ELLIPSE: 1, POLYGON: 1, STAR: 1, LINE: 1, BOOLEAN_OPERATION: 1, TEXT: 1 };
+
+/** Warp the geometry of a vector-like node through f: bezier segments are cut into `cuts` pieces and each point and tangent is mapped. */
+function perspectiveVector(node, f, box, cuts) {
+  var holder = node.clone();
+  node.parent.insertChild(node.parent.children.indexOf(node) + 1, holder);
+  var v = holder.type === "VECTOR" ? holder : figma.flatten([holder], node.parent);
+  var T = v.relativeTransform, net = v.vectorNetwork;
+  function toUV(p) {
+    var X = T[0][0] * p[0] + T[0][1] * p[1] + T[0][2], Y = T[1][0] * p[0] + T[1][1] * p[1] + T[1][2];
+    return [(X - box.x) / (box.w || 1), (Y - box.y) / (box.h || 1)];
+  }
+  function map(p) { var uv = toUV(p); return f(uv[0], uv[1]); }
+  // mapped tangent: the image of a short local offset
+  function mapT(p, d) { var a = map(p), b = map([p[0] + d[0], p[1] + d[1]]); return [b[0] - a[0], b[1] - a[1]]; }
+  var verts = net.vertices.map(function (p) { return { x: p.x, y: p.y }; });
+  var out = net.vertices.map(function (p) {
+    var m = map([p.x, p.y]), o = { x: m[0], y: m[1] };
+    ["strokeCap", "strokeJoin", "strokeMiterLimit", "cornerRadius", "handleMirroring"].forEach(function (k) { if (p[k] !== undefined) o[k] = p[k]; });
+    return o;
+  });
+  var segMap = [], newSegs = [];
+  net.segments.forEach(function (s, i) {
+    var a = verts[s.start], b = verts[s.end], ta = s.tangentStart || { x: 0, y: 0 }, tb = s.tangentEnd || { x: 0, y: 0 };
+    var straight = !ta.x && !ta.y && !tb.x && !tb.y;
+    var n = straight ? 1 : cuts, P = [[a.x, a.y], [a.x + ta.x, a.y + ta.y], [b.x + tb.x, b.y + tb.y], [b.x, b.y]];
+    function pt(t) {
+      var u = 1 - t;
+      return [0, 1].map(function (k) { return u * u * u * P[0][k] + 3 * u * u * t * P[1][k] + 3 * u * t * t * P[2][k] + t * t * t * P[3][k]; });
+    }
+    function der(t) {
+      var u = 1 - t;
+      return [0, 1].map(function (k) { return 3 * u * u * (P[1][k] - P[0][k]) + 6 * u * t * (P[2][k] - P[1][k]) + 3 * t * t * (P[3][k] - P[2][k]); });
+    }
+    var ids = [], prev = s.start;
+    for (var k = 1; k <= n; k++) {
+      var t0 = (k - 1) / n, t1 = k / n, dt = (t1 - t0) / 3, next;
+      if (k === n) next = s.end;
+      else { var m = map(pt(t1)); out.push({ x: m[0], y: m[1] }); next = out.length - 1; }
+      var d0 = der(t0), d1 = der(t1), seg = { start: prev, end: next };
+      if (!straight) {
+        var p0 = pt(t0), p1 = pt(t1), m0 = mapT(p0, [d0[0] * dt, d0[1] * dt]), m1 = mapT(p1, [-d1[0] * dt, -d1[1] * dt]);
+        seg.tangentStart = { x: m0[0], y: m0[1] };
+        seg.tangentEnd = { x: m1[0], y: m1[1] };
+      }
+      newSegs.push(seg);
+      ids.push(newSegs.length - 1);
+      prev = next;
+    }
+    segMap.push(ids);
+  });
+  var regions = (net.regions || []).map(function (r) {
+    var loops = r.loops.map(function (loop) {
+      var res = [], cur = null;
+      loop.forEach(function (si, idx) {
+        var s = net.segments[si], fwd = true;
+        if (cur === null) {
+          if (loop.length > 1) { var nx = net.segments[loop[1]]; fwd = s.end === nx.start || s.end === nx.end; }
+        } else fwd = s.start === cur;
+        var ids = segMap[si].slice();
+        if (!fwd) ids.reverse();
+        res = res.concat(ids);
+        cur = fwd ? s.end : s.start;
+      });
+      return res;
+    });
+    var o = { loops: loops, windingRule: r.windingRule };
+    if (r.fills) o.fills = r.fills;
+    if (r.fillStyleId) o.fillStyleId = r.fillStyleId;
+    return o;
+  });
+  // flipped sub-segments of a reversed loop must keep their own direction; Figma reads loops by connectivity.
+  var minX = Infinity, minY = Infinity;
+  out.forEach(function (p) { minX = Math.min(minX, p.x); minY = Math.min(minY, p.y); });
+  out.forEach(function (p) { p.x -= minX; p.y -= minY; });
+  v.relativeTransform = [[1, 0, minX], [0, 1, minY]];
+  v.vectorNetwork = { vertices: out, segments: newSegs, regions: regions };
+  v.name = node.name + " · perspective";
+  return v;
+}
+
+/** Warp any node through the map f by cutting it into a grid of image tiles, each an affine patch. */
+async function perspectiveRaster(node, f, box, o) {
+  var gx = Math.max(1, Math.min(64, Math.round(o.grid || 16))), gy = Math.max(1, Math.min(64, Math.round(o.gridY || o.grid || 16)));
+  var scale = o.scale || 2;
+  var bytes = await node.exportAsync({ format: "PNG", constraint: { type: "SCALE", value: scale } });
+  var img = figma.createImage(bytes);
+  var size = await img.getSizeAsync();
+  var w = box.w, h = box.h, cw = w / gx, ch = h / gy, ov = Math.min(cw, ch) * 0.04 + 0.4;
+  var tiles = [];
+  for (var j = 0; j < gy; j++) {
+    for (var i = 0; i < gx; i++) {
+      // source cell, widened a hair on the far sides so neighbouring tiles overlap and leave no seam
+      var sx0 = i * cw, sy0 = j * ch, sx1 = Math.min(w, (i + 1) * cw + (i < gx - 1 ? ov : 0)), sy1 = Math.min(h, (j + 1) * ch + (j < gy - 1 ? ov : 0));
+      var tw = sx1 - sx0, th = sy1 - sy0;
+      var p0 = f(sx0 / w, sy0 / h), p1 = f(sx1 / w, sy0 / h), p3 = f(sx0 / w, sy1 / h);
+      var r = figma.createRectangle();
+      r.resize(Math.max(0.01, tw), Math.max(0.01, th));
+      r.relativeTransform = [
+        [(p1[0] - p0[0]) / tw, (p3[0] - p0[0]) / th, p0[0]],
+        [(p1[1] - p0[1]) / tw, (p3[1] - p0[1]) / th, p0[1]],
+      ];
+      r.fills = [{
+        type: "IMAGE", imageHash: img.hash, scaleMode: "CROP",
+        imageTransform: [[tw / w, 0, sx0 / w], [0, th / h, sy0 / h]],
+      }];
+      r.name = "tile " + i + "," + j;
+      tiles.push(r);
+    }
+  }
+  var g = figma.group(tiles, node.parent);
+  g.name = node.name + " · perspective";
+  return g;
+}
+
+/**
+ * True perspective: h.perspective(node, {shrink:'top', amount:0.35}) or {quad:[TL,TR,BR,BL]} (parent coordinates).
+ * Vector-like nodes become a warped vector (live, crisp); frames, groups, images and anything else become an
+ * image-tile mesh ({grid}). The original is hidden unless {keep:true}. Returns the new node.
+ */
+async function perspectiveTransform(node, o) {
+  o = o || {};
+  if (!node || !node.parent) throw new Error("h.perspective: pass a node that lives on the canvas");
+  var box = parentBox(node), f = quadMap(perspectiveQuad(box, o));
+  var mode = o.mode || (PERSPECTIVE_VECTOR_TYPES[node.type] ? "vector" : "raster");
+  var res = mode === "vector" ? perspectiveVector(node, f, box, Math.max(2, Math.min(32, Math.round(o.cuts || 10)))) : await perspectiveRaster(node, f, box, o);
+  if (o.keep !== true) node.visible = false;
+  return res;
+}
+
 function recolorTree(n, color) {
   var paint = H.solid(color);
   if ("fills" in n && n.fills !== figma.mixed && n.fills.length) n.fills = n.fills.map(function (f) { return f.type === "IMAGE" ? f : paint; });
@@ -1160,6 +1341,8 @@ var H = {
   transform: transformAround,
   /** Isometric projection onto a cube face: h.iso(node, 'top' | 'left' | 'right', {scale}). Apply once per node. */
   iso: isoTransform,
+  /** True perspective: h.perspective(node, {shrink:'top', amount:0.35} | {quad:[TL,TR,BR,BL]}). Vector → warped vector, else image-tile mesh ({grid}). Original hidden unless {keep:true}. */
+  perspective: perspectiveTransform,
   /** Additive multi-radius bloom above the node (see makeGlow options). Returns the glow group. */
   glow: makeGlow,
   /** Re-tune a glow made by h.glow: h.glowUpdate(group, {intensity: 3}). Returns the rebuilt group (new id). */

@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- New `h.perspective(node, {shrink, amount} | {quad})`: true perspective with converging lines. Vector-like nodes become a warped vector (curves cut and re-fitted); frames, groups and images become an image-tile mesh. Documented in the `effects-glow-iso` skill.
+
 ## 0.3.0
 
 - Plugin **Glow tab**: select a glow group (or any layer to add one) and tune radius, intensity, spread, core, steps, blend and tint with live sliders; one drag is one Figma undo step. Glow settings are stored on the group, so glows made by agents appear there too. New `h.glowUpdate(group, patch)`.
