@@ -3,6 +3,7 @@
 ## Unreleased
 
 - New `h.perspective(node, {shrink, amount} | {quad})`: true perspective with converging lines. Vector-like nodes become a warped vector (curves cut and re-fitted); frames, groups and images become an image-tile mesh. Documented in the `effects-glow-iso` skill.
+- Fix: `h.glow` and the Glow tab put the glow far up-left when the layer's parent was not at 0,0 (clones were grouped by absolute position). Clones now take the layer's parent-relative transform, also inside auto-layout frames.
 
 ## 0.3.0
 

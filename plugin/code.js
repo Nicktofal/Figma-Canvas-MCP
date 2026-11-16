@@ -1115,6 +1115,7 @@ async function perspectiveRaster(node, f, box, o) {
       var tw = sx1 - sx0, th = sy1 - sy0;
       var p0 = f(sx0 / w, sy0 / h), p1 = f(sx1 / w, sy0 / h), p3 = f(sx0 / w, sy1 / h);
       var r = figma.createRectangle();
+      node.parent.appendChild(r); // tile coordinates are in the parent's space
       r.resize(Math.max(0.01, tw), Math.max(0.01, th));
       r.relativeTransform = [
         [(p1[0] - p0[0]) / tw, (p3[0] - p0[0]) / th, p0[0]],
@@ -1189,6 +1190,12 @@ function glowLayers(node, o) {
     if (total <= 0) continue;
     for (var c = 0; c < copies; c++) {
       var cl = node.clone();
+      // clone() may land at page level; put it in the node's parent and copy the parent-relative transform,
+      // otherwise group() keeps the absolute position and the glow drifts by the parent's offset
+      var par = node.parent;
+      par.appendChild(cl);
+      if (par.layoutMode && par.layoutMode !== "NONE") { try { cl.layoutPositioning = "ABSOLUTE"; } catch (err) { /* older files */ } }
+      cl.relativeTransform = node.relativeTransform;
       cl.name = "glow " + Math.round(radii[i]) + "px";
       if (o.color) recolorTree(cl, o.color);
       cl.effects = [{ type: "LAYER_BLUR", radius: Math.max(0.5, radii[i]), visible: true }];
